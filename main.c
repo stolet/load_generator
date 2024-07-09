@@ -81,11 +81,6 @@ int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint32_t *incoming_id
 	
 	// retrieve the index of the flow from the NIC (NIC tags the packet according the 5-tuple using DPDK rte_flow)
 	uint32_t flow_id = pkt->hash.fdir.hi;
-
-	// sanity check
-	if(unlikely(flow_id != f_id)) {
-		return 0;
-	}
 	
 	// get control block for the flow
 	tcp_control_block_t *block = &tcp_control_blocks[flow_id];
@@ -97,6 +92,8 @@ int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint32_t *incoming_id
 	uint32_t seq = rte_be_to_cpu_32(tcp_hdr->sent_seq);
 	if(likely(SEQ_LT(block->last_seq_recv, seq))) {
 		block->last_seq_recv = seq;
+	} else {
+		return 0;
 	}
 
 	// update ACK number in the TCP control block from the packet
