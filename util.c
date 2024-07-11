@@ -1,5 +1,10 @@
 #include "util.h"
 
+double srv_mode;
+uint64_t srv_distribution;
+uint64_t srv_iterations0;
+uint64_t srv_iterations1;
+
 int distribution;
 char output_file[MAXSTRLEN];
 
@@ -247,6 +252,7 @@ int app_parse_args(int argc, char **argv) {
 				rte_exit(EXIT_FAILURE, "The minimum packet size is %d.\n", MIN_PKTSIZE);
 			}
 			tcp_payload_size = (frame_size - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_tcp_hdr));
+                        printf("payload=%d\n", tcp_payload_size);
 			break;
 
 		// duration (s)
@@ -311,7 +317,6 @@ void print_stats_output() {
 	
 	if((incoming_idx + total_never_sent) != rate * duration) {
 		printf("ERROR: received %d and %ld never sent\n", incoming_idx, total_never_sent);
-		return;
 	}
 	
 	// open the file

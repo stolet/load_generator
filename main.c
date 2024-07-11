@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <unistd.h>
 
 #include "util.h"
 #include "tcp_util.h"
@@ -25,7 +26,7 @@ uint32_t frame_size;
 uint32_t tcp_payload_size;
 
 // General variables
-uint64_t TICKS_PER_US;
+uint64_t TICKS_PER_US = 0;
 uint16_t *flow_indexes_array;
 uint32_t *interarrival_array;
 application_node_t *application_array;
@@ -51,12 +52,42 @@ uint32_t src_ipv4_addr;
 struct rte_ether_addr dst_eth_addr;
 struct rte_ether_addr src_eth_addr;
 
+static inline void calibrate_tsc(void)
+{
+  struct timespec ts_before, ts_after;
+  uint64_t tsc;
+  double freq;
+
+  if (TICKS_PER_US != 0)
+    return;
+
+  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts_before) != 0) {
+    fprintf(stderr, "calibrate_tsc: clock_gettime(CLOCK_MONOTONIC_RAW) "
+        "failed\n");
+    abort();
+  }
+
+  tsc = rte_rdtsc();
+  usleep(10000);
+  tsc = rte_rdtsc() - tsc;
+
+  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts_after) != 0) {
+    fprintf(stderr, "calibrate_tsc: clock_gettime(CLOCK_MONOTONIC_RAW) "
+        "failed\n");
+    abort();
+  }
+
+  freq = ((ts_after.tv_sec * 1000000UL) + (ts_after.tv_nsec / 1000)) -
+    ((ts_before.tv_sec * 1000000UL) + (ts_before.tv_nsec / 1000));
+  TICKS_PER_US = tsc / freq;
+}
+
 // Process the incoming TCP packet
 int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint32_t *incoming_idx) {
 	// process only TCP packets
 	struct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
 	if(unlikely(ipv4_hdr->next_proto_id != IPPROTO_TCP)) {
-		return 0;
+                return 0;
 	}
 
 	// get TCP header
@@ -66,11 +97,11 @@ int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint32_t *incoming_id
 	// get TCP payload size
 	uint32_t tcp_hdr_len = ((tcp_hdr->data_off >> 4)*4);
 	uint32_t packet_data_size = rte_be_to_cpu_16(ipv4_hdr->total_length) - ip_hdr_len - tcp_hdr_len;
-
+    
 	// do not process empty packets
 	if(unlikely(packet_data_size == 0)) {
-		return 0;
-	}
+                return 0;
+        }
 
 	// obtain both timestamps from the packet
 	uint64_t *payload = (uint64_t *)(((uint8_t*) tcp_hdr) + tcp_hdr_len);
@@ -78,7 +109,7 @@ int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint32_t *incoming_id
 	uint64_t t1 = payload[1];
 	uint64_t f_id = payload[2];
 	uint64_t w_id = payload[3];
-	
+
 	// retrieve the index of the flow from the NIC (NIC tags the packet according the 5-tuple using DPDK rte_flow)
 	uint32_t flow_id = pkt->hash.fdir.hi;
 	
@@ -307,7 +338,8 @@ static int lcore_tx(void *arg) {
 		// fill the TCP ACK field
 		hot_fill_tcp_packet(block, pkt);
 
-		// send the packet
+		
+                // send the packet
 		rte_eth_tx_burst(portid, qid, &pkt, 1);
 
 		// update the counter
@@ -352,6 +384,9 @@ int main(int argc, char **argv) {
 
 	// initialize TCP control blocks
 	init_tcp_blocks();
+
+	// Calibrate TSC
+	calibrate_tsc();
 
 	// start client (3-way handshake for each flow)
 	start_client(portid);
