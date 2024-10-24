@@ -295,8 +295,9 @@ int app_parse_args(int argc, char **argv) {
 // Wait for the duration parameter
 void wait_timeout() {
 	uint32_t remaining_in_s = 5;
+	fprintf(stderr, "in wait_timeout\n");
 	rte_delay_us_sleep((duration + remaining_in_s) * 1000000);
-
+	fprintf(stderr, "finished sleeping\n");
 	// set quit flag for all internal cores
 	quit_rx = 1;
 	quit_tx = 1;

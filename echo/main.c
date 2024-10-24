@@ -411,12 +411,13 @@ int main(int argc, char **argv) {
 	wait_timeout();
 
 	// wait for RX/TX threads
-	uint32_t lcore_id;
-	RTE_LCORE_FOREACH_WORKER(lcore_id) {
-		if(rte_eal_wait_lcore(lcore_id) < 0) {
-			return -1;
-		}
-	}
+	//uint32_t lcore_id;
+	//RTE_LCORE_FOREACH_WORKER(lcore_id) {
+	//	if(rte_eal_wait_lcore(lcore_id) < 0) {
+	//		return -1;
+	//	}
+	//}
+	sleep(5);
 
 	// print stats
 	print_stats_output();
