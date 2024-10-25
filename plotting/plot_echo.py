@@ -18,14 +18,14 @@ def plot_data(df):
         sorted_df = df[df['Name'] == name].sort_values(by="Rate")
 
         print(sorted_df)
-    
+
     # Convert from nanoseconds to microseconds
     df["99.9p"] = df.apply(lambda row: row["99.9p"] / 1000, axis=1)
 
     sns.set_theme()
     lineplot = sns.lineplot(x="Rate", y="99.9p", hue="Name", data=df, marker="o")
     lineplot.set(xlabel="Throughput [req/s]", ylabel="99.9p Latency [µs]")
-    
+
     plt.ylim(0, 500)
     plt.xlim(0, 150000)
     plt.savefig("lat_echo.png", dpi=2000)
@@ -45,25 +45,25 @@ def parse_log_file(filepath):
 
 def parse_logs(directory):
     results = {}
-    
+
     for filename in os.listdir(directory):
         if filename.endswith('.log'):
             name, rate, run = filename.split('_')
             rate = int(rate)
             run = int(run.split('.')[0])
-            
+
             filepath = os.path.join(directory, filename)
             data = parse_log_file(filepath)
-            
+
             key = (name, rate)
             if key not in results:
                 results[key] = {'50p': [], '99p': [], '99.9p': []}
-           
+
             print(filename)
             results[key]['50p'].append(data['50p'])
             results[key]['99p'].append(data['99p'])
             results[key]['99.9p'].append(data['99.9p'])
-    
+
     # Calculate averages and prepare data for DataFrame
     averaged_results = []
     for (name, rate), values in results.items():
@@ -71,7 +71,7 @@ def parse_logs(directory):
         avg_99p = int(sum(values['99p']) / len(values['99p']))
         avg_99_9p = int(sum(values['99.9p']) / len(values['99.9p']))
         averaged_results.append({'Name': name, 'Rate': rate, '50p': avg_50p, '99p': avg_99p, '99.9p': avg_99_9p})
-    
+
     # Create DataFrame
     df = pd.DataFrame(averaged_results)
     return df

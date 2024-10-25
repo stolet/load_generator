@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--directory", required=True, 
+    parser.add_argument("-d", "--directory", required=True,
         help="Path to the directory containing log files.")
     args = parser.parse_args()
     return args
@@ -18,7 +18,7 @@ def parse_log_file(file_path):
 
     file_name = os.path.basename(file_path)
     system, rate = file_name.split('_')[0], file_name.split('_')[1].split('.')[0]
-    
+
     p50_latency, p99_latency, p99_9_latency = None, None, None
     for line in lines:
         if line.startswith("Totals"):
@@ -27,7 +27,7 @@ def parse_log_file(file_path):
             p99_latency = float(parts[6])
             p99_9_latency = float(parts[7])
             break
-    
+
     return system, int(rate), p50_latency, p99_latency, p99_9_latency
 
 
@@ -41,10 +41,10 @@ def parse_logs(directory):
     }
 
     for file_name in os.listdir(directory):
-        if file_name.endswith(".log"):  
+        if file_name.endswith(".log"):
             file_path = os.path.join(directory, file_name)
             system, rate, p50, p99, p99_9 = parse_log_file(file_path)
-            
+
             data["System"].append(system)
             data["Rate"].append(rate)
             data["p50"].append(p50)

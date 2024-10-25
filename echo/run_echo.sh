@@ -28,12 +28,12 @@ for ((i=1; i<=n_runs; i++)); do
         ssh ${user}@${host} "cd ${bench_path}; sudo bash start-server.sh ${benchmark} ${ip}" &
         sleep 4
         echo "Server started"
-       
+
 	sudo LD_LIBRARY_PATH=$HOME/lib/x86_64-linux-gnu ./build/load-generator \
 	    -a d8:00.0 -n 1 -c 0xff -- \
             -d uniform -r ${rate} -f 1 -s 128 -t 10 -e 37 \
             -c addr.cfg -o output.dat -D constant -i 0 -j 0 -m 0
-	
+
 	echo "Killing server"
 	if [ "$benchmark" == "shim" ]; then
 	    ssh ${user}@${host} 'PID=$(pidof shim-tcp-ping-pong.elf); sudo kill $PID'
@@ -41,8 +41,8 @@ for ((i=1; i<=n_runs; i++)); do
 	    ssh ${user}@${host} 'PID=$(pidof tcp-ping-pong.elf); sudo kill $PID'
 	fi
 	echo "Killing any ports that didn't close"
-	ssh ${user}@${host} 'sudo kill $(sudo lsof -t -i :56789)'	
-	
+	ssh ${user}@${host} 'sudo kill $(sudo lsof -t -i :56789)'
+
 	sudo chown $user output.dat
 	python3 parse_lat.py | tee $log_dir/${benchmark}_${rate}_${i}.log
 	rm output.dat

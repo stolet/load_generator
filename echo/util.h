@@ -22,27 +22,29 @@
 #include <rte_mempool.h>
 
 // Constants
-#define EPSILON						0.00001
-#define MAXSTRLEN					128
-#define MIN_PKTSIZE					96
-#define CONSTANT_VALUE				0
-#define UNIFORM_VALUE				1
-#define EXPONENTIAL_VALUE			2
-#define BIMODAL_VALUE				3
-#define LOGNORMAL_VALUE				4
-#define PARETO_VALUE				5
-#define IPV4_ADDR(a, b, c, d)		(((d & 0xff) << 24) | ((c & 0xff) << 16) | ((b & 0xff) << 8) | (a & 0xff))
+#define EPSILON 0.00001
+#define MAXSTRLEN 128
+#define MIN_PKTSIZE 96
+#define CONSTANT_VALUE 0
+#define UNIFORM_VALUE 1
+#define EXPONENTIAL_VALUE 2
+#define BIMODAL_VALUE 3
+#define LOGNORMAL_VALUE 4
+#define PARETO_VALUE 5
+#define IPV4_ADDR(a, b, c, d) (((d & 0xff) << 24) | ((c & 0xff) << 16) | ((b & 0xff) << 8) | (a & 0xff))
 
-#define PAYLOAD_OFFSET				14+20+20
+#define PAYLOAD_OFFSET 14 + 20 + 20
 
-typedef struct timestamp_node_t {
+typedef struct timestamp_node_t
+{
 	uint64_t timestamp_rx;
 	uint64_t timestamp_tx;
 	uint64_t flow_id;
 	uint64_t worker_id;
 } node_t;
 
-typedef struct application_node_t {
+typedef struct application_node_t
+{
 	uint64_t iterations;
 	uint64_t randomness;
 } application_node_t;

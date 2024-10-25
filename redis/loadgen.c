@@ -88,7 +88,7 @@ void print_usage(const char *prog_name)
          "  --port <INT>           Redis server listening port                         \n"
          "  --duration <INT>       Number of seconds to run                            \n"
          "                                                                             \n"
-        "Load options:                                                                 \n"
+         "Load options:                                                                 \n"
          "  --nconns <INT>         Number of connections per core                      \n"
          "  --ncores <INT>         Nunber of cores                                     \n"
          "                                                                             \n"
@@ -112,8 +112,7 @@ int parse_args(int argc, char **argv, struct config *conf)
       {"ncores", required_argument, 0, 0},
       {"ratio", required_argument, 0, 0},
       {"distribution", required_argument, 0, 0},
-      {0, 0, 0, 0}
-  };
+      {0, 0, 0, 0}};
 
   while ((opt = getopt_long(argc, argv, "", options, &option_index)) != -1)
   {
@@ -502,7 +501,6 @@ int redis_connect(const char *ip, int port)
 
 int redis_connect_all(struct core *cor)
 {
-
 }
 
 /*****************************************************************************/
@@ -544,7 +542,7 @@ int start_cores(struct loadgen *lg)
   for (i = 0; i < lg->conf->ncores; i++)
   {
     ret = pthread_create(&lg->cores[i].pthread, NULL,
-        start_core, &lg->cores[i]);
+                         start_core, &lg->cores[i]);
 
     if (ret != 0)
     {
@@ -556,7 +554,6 @@ int start_cores(struct loadgen *lg)
 
 int stop_cores(struct loadgen *lg)
 {
-
 }
 
 /*****************************************************************************/
@@ -613,7 +610,9 @@ int main(int argc, char **argv)
 
   // Wait for experiment duration
   long end_time = get_time_ms() + lg.conf->duration * 1000;
-  while (get_time_ms() < end_time) {}
+  while (get_time_ms() < end_time)
+  {
+  }
 
   // Get statistics
 
