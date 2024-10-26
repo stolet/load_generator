@@ -1,3 +1,4 @@
 build/
 *.dat
 logs/
+.vscode/

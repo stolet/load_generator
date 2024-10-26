@@ -1,24 +1,27 @@
 TARGET = loadgen
+BUILD_DIR = build
 
 CC = gcc
 
 CFLAGS = -Wall -Wextra -O3
-LDFLAGS = -lm
+LDFLAGS = -lm -lpthread
 
 SRC = loadgen.c
+OBJ = $(BUILD_DIR)/$(SRC:.c=.o)
 
-OBJ = $(SRC:.c=.o)
+all: $(BUILD_DIR) $(BUILD_DIR)/$(TARGET)
 
-all: $(TARGET)
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
 
-$(TARGET): $(OBJ)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJ) $(LDFLAGS)
+$(BUILD_DIR)/$(TARGET): $(OBJ)
+	$(CC) $(CFLAGS) -o $(BUILD_DIR)/$(TARGET) $(OBJ) $(LDFLAGS)
 
-%.o: %.c
+$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -rf $(BUILD_DIR)
 
 .PHONY: all clean
 

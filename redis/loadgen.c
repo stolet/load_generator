@@ -3,6 +3,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <sys/time.h>
@@ -12,15 +13,16 @@
 #include <math.h>
 #include <pthread.h>
 #include <sys/epoll.h>
+#include <errno.h>
 
-#define MAX_KEY_BUF 64
-#define MAX_COMMAND_BUF 1024
+#define MAX_BUF 1024
 #define MIN_KEY 1
 #define MAX_KEY 10000
 #define MAX_CONNS 1000
 #define DEFAULT_VAL_SIZE 64
 #define DEFAULT_SET_RATIO 1
 #define DEFAULT_GET_RATIO 9
+#define DEFAULT_MAX_PENDING_REQS 1
 
 static int next_core_id = 0;
 
@@ -38,42 +40,75 @@ enum conn_state
   CONN_CONNECTED
 };
 
+////// READ ONLY //////
 struct config
 {
+  // IP address of redis server
   const char *ip;
+  // Port of redis server
   int port;
+  // How long to run loadgen for
   int duration;
+  // How many SET requests to send compared to GET
   int set_ratio;
+  // How many GET requests to send compared to SET
   int get_ratio;
+  // Number of threads to start
   int ncores;
+  // Number of connections to open per core
   int nconns;
+  // Max number of pending requests for each conenction
+  int max_pending;
+  // Distribution to use to sample keys
   enum dist dist;
 };
+///////////////////////
 
 struct conn
 {
+  // Socket fd for connection
   int fd;
+  // Connection status from conn_state
   int status;
+  // Number of pending requests sent to redis
+  int pending;
+  // Buffer used to transmit requests to redis
   char *tx_buf;
+  // Buffer used to received requests from redis
   char *rx_buf;
+  // Array of unique set keys sent by this connection
+  int *set_keys;
+  // Number of unique set keys sent by this connection
+  int set_keys_n;
+  // Index that determines if next key is a SET or GET
+  int ratio_i;
+  // Max value for ratio i before it loops back to 0
+  int ratio_max_i;
+  // Sequential counter used to determine next key in SEQUENTIAL distribution
+  int sequential_counter;
 };
 
 struct core
 {
+  // Core id
   int id;
+  // Epoll fd used to wait for events
   int ep;
+  // Configuration parameters
   struct config *conf;
+  // Array of connections for this core
   struct conn *conns;
+  // Pthread used to start thread
   pthread_t pthread;
 };
 
 struct loadgen
 {
+  // Configuration for load generator
   struct config *conf;
+  // Start time for load generator
   struct timeval start_time;
-  int sequential_counter;
-  int *set_keys;
-  int set_key_count;
+  // Array of cores started by pthread_create
   struct core *cores;
 };
 
@@ -82,20 +117,21 @@ struct loadgen
 
 void print_usage(const char *prog_name)
 {
-  printf("Usage: %s [options]                                                          \n"
-         "General options:                                                             \n"
-         "  --host <ADDR>          Redis server ip address                             \n"
-         "  --port <INT>           Redis server listening port                         \n"
-         "  --duration <INT>       Number of seconds to run                            \n"
-         "                                                                             \n"
-         "Load options:                                                                 \n"
-         "  --nconns <INT>         Number of connections per core                      \n"
-         "  --ncores <INT>         Nunber of cores                                     \n"
-         "                                                                             \n"
-         "Key options:                                                                 \n"
-         "  --ratio <SET:GET>      Ratio of SET and GET commands [default: %d:%d]      \n"
-         "  --distribution <dist>  Distribution to generate keys [default: uniform]    \n"
-         "    Options: uniform, zipfian, sequential                                    \n",
+  printf("Usage: %s [options]                                                             \n"
+         "General options:                                                                \n"
+         "  --host     <ADDR>  Redis server ip address                                    \n"
+         "  --port     <INT>   Redis server listening port                                \n"
+         "  --duration <INT>   Number of seconds to run                                   \n"
+         "                                                                                \n"
+         "Load options:                                                                   \n"
+         "  --nconns   <INT>  Number of connections per core                              \n"
+         "  --ncores   <INT>  Number of cores                                             \n"
+         "  --pending  <INT>  Max number of requests per connection                       \n"
+         "                                                                                \n"
+         "Key options:                                                                    \n"
+         "  --ratio        <SET:GET>  Ratio of SET and GET commands [default: %d:%d]      \n"
+         "  --distribution <dist>     Distribution to generate keys [default: uniform]    \n"
+         "    Options: uniform, zipfian, sequential                                       \n",
          prog_name, DEFAULT_SET_RATIO, DEFAULT_GET_RATIO);
 }
 
@@ -110,6 +146,7 @@ int parse_args(int argc, char **argv, struct config *conf)
       {"duration", required_argument, 0, 0},
       {"nconns", required_argument, 0, 0},
       {"ncores", required_argument, 0, 0},
+      {"pending", required_argument, 0, 0},
       {"ratio", required_argument, 0, 0},
       {"distribution", required_argument, 0, 0},
       {0, 0, 0, 0}};
@@ -117,7 +154,7 @@ int parse_args(int argc, char **argv, struct config *conf)
   while ((opt = getopt_long(argc, argv, "", options, &option_index)) != -1)
   {
     if (opt == 0)
-    { // Long options have been detected
+    {
       if (strcmp(options[option_index].name, "host") == 0)
       {
         conf->ip = optarg;
@@ -179,6 +216,10 @@ int parse_args(int argc, char **argv, struct config *conf)
     {
       conf->ncores = atoi(optarg);
     }
+    else if (strcmp(options[option_index].name, "pending") == 0)
+    {
+      conf->ncores = atoi(optarg);
+    }
     else
     {
       print_usage(argv[0]);
@@ -200,31 +241,46 @@ void init_config(struct config *conf)
   conf->duration = 0;
   conf->set_ratio = DEFAULT_SET_RATIO;
   conf->get_ratio = DEFAULT_GET_RATIO;
+  conf->max_pending = DEFAULT_MAX_PENDING_REQS;
   conf->dist = UNIFORM;
 }
 
-int init_conn(struct conn *con)
+int init_conn(struct config *conf, struct conn *con)
 {
+  int *set_keys;
   char *tx_buf, *rx_buf;
 
-  con->fd = -1;
-  con->status = CONN_DISCONNETED;
-
-  tx_buf = malloc(MAX_COMMAND_BUF);
+  tx_buf = malloc(MAX_BUF);
   if (tx_buf == NULL)
   {
     fprintf(stderr, "init_conn: failed to malloc tx_buf\n");
     return -1;
   }
-  con->tx_buf = tx_buf;
 
-  rx_buf = malloc(MAX_COMMAND_BUF);
+  rx_buf = malloc(MAX_BUF);
   if (rx_buf == NULL)
   {
     fprintf(stderr, "init_conn: failed to malloc rx_buf\n");
     return -1;
   }
+
+  set_keys = calloc(MAX_KEY, sizeof(int));
+  if (set_keys == NULL)
+  {
+    fprintf(stderr, "init_conn: failed to malloc set_keys\n");
+    return -1;
+  }
+
+  con->fd = -1;
+  con->status = CONN_DISCONNETED;
+  con->pending = 0;
+  con->tx_buf = tx_buf;
   con->rx_buf = rx_buf;
+  con->set_keys = set_keys;
+  con->set_keys_n = 0;
+  con->ratio_i = 0;
+  con->ratio_max_i = conf->set_ratio + conf->get_ratio;
+  con->sequential_counter = MIN_KEY;
 
   return 0;
 }
@@ -234,7 +290,6 @@ int init_core(struct core *cor, struct config *conf)
   int i, ret, ep;
   struct conn *conns;
 
-  cor->conf = conf;
 
   conns = calloc(conf->nconns, sizeof(struct conn));
   if (conns == NULL)
@@ -242,11 +297,10 @@ int init_core(struct core *cor, struct config *conf)
     fprintf(stderr, "init_core: failed to allocate connections\n");
     return -1;
   }
-  cor->conns = conns;
 
   for (i = 0; i < conf->nconns; i++)
   {
-    ret = init_conn(&conns[i]);
+    ret = init_conn(conf, &conns[i]);
     if (ret < 0)
     {
       fprintf(stderr, "init_core: failed to initialize connection\n");
@@ -260,28 +314,20 @@ int init_core(struct core *cor, struct config *conf)
     fprintf(stderr, "init_core: epoll_create failed\n");
     return -1;
   }
-  cor->ep = ep;
 
+  cor->conf = conf;
+  cor->conns = conns;
+  cor->ep = ep;
   cor->id = next_core_id++;
+  return 0;
 }
 
 int init_loadgen(struct loadgen *lg, struct config *conf)
 {
-  int *set_keys;
   struct core *cores;
 
   lg->conf = conf;
   gettimeofday(&lg->start_time, NULL);
-  lg->sequential_counter = MIN_KEY;
-  lg->set_key_count = 0;
-
-  set_keys = malloc(MAX_KEY * sizeof(int));
-  if (set_keys == NULL)
-  {
-    fprintf(stderr, "init_loadgen: failed to malloc set_keys\n");
-    return -1;
-  }
-  lg->set_keys = set_keys;
 
   cores = calloc(conf->ncores, sizeof(struct core));
   for (int i = 0; i < conf->ncores; i++)
@@ -320,21 +366,21 @@ int sample_zipf(int s, int n)
   return n;
 }
 
-int sample_sequential(struct loadgen *lg)
+int sample_sequential(struct conn *con)
 {
-  return lg->sequential_counter++ % MAX_KEY;
+  return con->sequential_counter++ % MAX_KEY;
 }
 
-int generate_key(struct loadgen *lg)
+int generate_key(struct core *cor, struct conn *con)
 {
-  switch (lg->conf->dist)
+  switch (cor->conf->dist)
   {
   case UNIFORM:
     return sample_uniform(MIN_KEY, MAX_KEY);
   case ZIPFIAN:
     return sample_zipf(1.0, MAX_KEY);
   case SEQUENTIAL:
-    return sample_sequential(lg);
+    return sample_sequential(con);
   default:
     return sample_uniform(MIN_KEY, MAX_KEY);
   }
@@ -345,10 +391,9 @@ int generate_key(struct loadgen *lg)
 /*****************************************************************************/
 /********************************** Data path ********************************/
 
-void redis_set(int fd, const char *key, size_t key_len,
-               const char *val, size_t val_len)
+int redis_set(int fd, char *key, size_t key_len, char *val, size_t val_len)
 {
-  char buffer[MAX_COMMAND_BUF];
+  char buffer[MAX_BUF];
 
   int len = snprintf(buffer, sizeof(buffer),
                      "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
@@ -356,45 +401,175 @@ void redis_set(int fd, const char *key, size_t key_len,
 
   if (len < 0)
   {
-    perror("snprintf failed for SET command");
-    return;
+    perror("redis_set: snprintf failed for SET command");
+    return -1;
   }
 
-  if (len > MAX_COMMAND_BUF)
+  if (len > MAX_BUF)
   {
-    perror("buffer too small for SET command");
+    perror("redis_set: buffer too small for SET command");
+    return -1;
   }
 
   int ret = send(fd, buffer, len, 0);
   if (ret == -1)
   {
-    perror("Failed to send SET command");
+    perror("redis_set: failed to send SET command");
+    return -1;
   }
+
+  return 0;
 }
 
-void redis_get(int fd, const char *key, size_t key_len)
+int redis_get(int fd, char *key, size_t key_len)
 {
-  char buffer[MAX_COMMAND_BUF];
+  char buffer[MAX_BUF];
 
   int len = snprintf(buffer, sizeof(buffer),
                      "*2\r\n$3\r\nGET\r\n$%zu\r\n%s\r\n", key_len, key);
 
   if (len < 0)
   {
-    perror("snprintf failed for SET command");
-    return;
+    perror("redis_get: snprintf failed for SET command");
+    return -1;
   }
 
-  if (len > MAX_COMMAND_BUF)
+  if (len > MAX_BUF)
   {
-    perror("buffer too small SET command");
+    perror("redis_get: buffer too small SET command");
+    return -1;
   }
 
   int ret = send(fd, buffer, len, 0);
   if (ret == -1)
   {
-    perror("Failed to send GET command");
+    perror("redis_get: failed to send GET command");
+    return -1;
   }
+
+  return 0;
+}
+
+int redis_parse_response(char *buf)
+{
+  int ret, str_len;
+  char *str_start;
+  // Parse first character to determine type of response
+  switch (buf[0])
+  {
+    case '+':
+      // Simple string: SET
+      printf("SET: %s\n", buf);
+      break;
+    case '$':
+      // Bulk string: GET
+      ret = sscanf(buf + 1, "%d\r\n", &str_len);
+      if (ret != 1)
+      {
+        fprintf(stderr, "redis_parse_response: failed to get str_len\n");
+        return -1;
+      }
+
+      // Sent a GET for nonexistent key
+      if (str_len == -1)
+      {
+        printf("GET: nonexistent key\n");
+        return 0;
+      }
+
+      // Find the start of the bulk string
+      str_start = strstr(buf, "\r\n") + 2;
+
+      // Check if str_len + trailing \r\n matches bulk string
+      if (strlen(str_start) < (size_t) (str_len + 2))
+      {
+        fprintf(stderr, "redis_parse_response: "
+            "size of bulk string is incorrect\n");
+      }
+
+      // Add trailing 0 so we can print string
+      printf("GET: %s\n", str_start);
+      break;
+    case '-':
+      // Error
+      fprintf(stderr, "redis_parse_response: incorrect command\n");
+      return -1;
+      break;
+    default:
+      fprintf(stderr, "redis_parse_response: unknow response type\n");
+      return -1;
+      break;
+  }
+
+  return 0;
+}
+
+int redis_recv(struct conn *con)
+{
+  int ret, len;
+  char buf[MAX_BUF];
+
+  while (con->pending > 0)
+  {
+    len = recv(con->fd, buf, sizeof(buf), 0);
+    if (len < 0)
+    {
+      perror("redis_recv: error when calling recv");
+    }
+
+    // Add null terminator to string
+    buf[len] = '\0';
+    ret = redis_parse_response(buf);
+    if (ret < 0)
+    {
+      fprintf(stderr, "redis_recv: failed to parse redis response\n");
+      return -1;
+    }
+
+    con->pending--;
+  }
+
+  return 0;
+
+}
+
+int redis_send(struct core *cor, struct conn *con)
+{
+  int ret;
+  int key, key_len;
+  char key_str[MAX_BUF];
+  char set_val[DEFAULT_VAL_SIZE];
+
+  key = generate_key(cor, con);
+  key_len = snprintf(key_str, MAX_BUF, "%d", key);
+
+  while (con->pending < cor->conf->max_pending)
+  {
+    if (con->ratio_i < cor->conf->set_ratio)
+    {
+      ret = redis_set(con->fd, key_str, key_len, set_val, DEFAULT_VAL_SIZE);
+      if (ret < 0)
+      {
+        fprintf(stderr, "redis_send: sending SET command failed\n");
+        return -1;
+      }
+    }
+    else
+    {
+      ret = redis_get(con->fd, key_str, key_len);
+      if (ret < 0)
+      {
+        fprintf(stderr, "redis_send: sending GET command failed\n");
+        return -1;
+      }
+    }
+
+    con->ratio_i = (con->ratio_i + 1) % con->ratio_max_i;
+    con->pending++;
+  }
+
+  return 0;
+
 }
 
 int handle_events(struct core *cor, struct epoll_event *evs, int n)
@@ -412,7 +587,7 @@ int handle_events(struct core *cor, struct epoll_event *evs, int n)
     {
       // Use getsockopt to query connection status
       slen = sizeof(status);
-      ret = getsockopt(con, SOL_SOCKET, SO_ERROR, &status, &slen);
+      ret = getsockopt(con->fd, SOL_SOCKET, SO_ERROR, &status, &slen);
       if (ret < 0)
       {
         fprintf(stderr, "handle_events: getsockopt failed\n");
@@ -427,46 +602,33 @@ int handle_events(struct core *cor, struct epoll_event *evs, int n)
       else
       {
         fprintf(stderr, "handle_events: failed status from getsockopt\n");
+        return -1;
       }
     }
 
     // Check if we received a response
     if (evs[i].events & EPOLLIN)
     {
-      redis_recv(cor, con);
+      ret = redis_recv(con);
+      if (ret < 0)
+      {
+        fprintf(stderr, "handle_events: redis_recv failed\n");
+      }
     }
 
-    // Send commands to redis
-    redis_send(cor, con);
-  }
-}
-
-void generate_load(struct loadgen *lg)
-{
-  int i, total_requests, key, key_len;
-  char key_str[MAX_KEY_BUF];
-  const char set_val[DEFAULT_VAL_SIZE];
-
-  total_requests = lg->conf->set_ratio + lg->conf->get_ratio;
-
-  while (1)
-  {
-    for (i = 0; i < total_requests; i++)
+    // Send commands to redis while pending has not reached max
+    if (con->pending < cor->conf->max_pending)
     {
-      key = generate_key(lg);
-      key_len = snprintf(key_str, MAX_KEY_BUF, "%d", key);
-
-      if (i < lg->conf->set_ratio)
+      ret = redis_send(cor, con);
+      if (ret < 0)
       {
-        redis_set(lg->conn_fd, key_str, key_len,
-                  set_val, DEFAULT_VAL_SIZE);
-      }
-      else
-      {
-        redis_get(lg->conn_fd, key_str, key_len);
+        fprintf(stderr, "handle_events: redis_send faield\n");
+        return -1;
       }
     }
   }
+
+  return 0;
 }
 
 /*****************************************************************************/
@@ -474,10 +636,15 @@ void generate_load(struct loadgen *lg)
 /*****************************************************************************/
 /******************************** Control Path *******************************/
 
-int redis_connect(const char *ip, int port)
+int redis_connect(struct core *cor, struct conn *con)
 {
-  int conn_fd;
+  int conn_fd, flags, ret, port;
+  const char *ip;
+  struct epoll_event ev;
   struct sockaddr_in server_addr;
+
+  ip = cor->conf->ip;
+  port = cor->conf->port;
 
   conn_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (conn_fd < 0)
@@ -486,21 +653,69 @@ int redis_connect(const char *ip, int port)
     return -1;
   }
 
+  // Get current flags for socket
+  flags = fcntl(conn_fd, F_GETFL, 0);
+  if (flags < 0)
+  {
+    perror("redis_connect: failed to get socket flgs");
+    return -1;
+  }
+
+  // Set socket to nonblocking
+  flags |= O_NONBLOCK;
+  ret = fcntl(conn_fd, F_SETFL, 0);
+  if (ret < 0)
+  {
+    perror("redis_connect: failed to set socket to nonblocking");
+    return -1;
+  }
+
+  // Add socket to epoll
+  ret = epoll_ctl(cor->ep, EPOLL_CTL_ADD, conn_fd, &ev);
+  if (ret < 0)
+  {
+    perror("redis_connect: failed to add socket to epoll");
+    return -1;
+  }
+
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(port);
   server_addr.sin_addr.s_addr = inet_addr(ip);
 
-  if (connect(conn_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+  ret = connect(conn_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+  if (ret == 0)
   {
-    perror("Connection failed");
+    con->status = CONN_CONNECTED;
+  }
+  else if (ret < 0  && errno == EINPROGRESS)
+  {
+    con->status = CONN_CONNECTING;
+  }
+  else
+  {
+    perror("redis_connect: failed to connect");
     return -1;
   }
 
-  return conn_fd;
+  con->fd = conn_fd;
+  return 0;
 }
 
 int redis_connect_all(struct core *cor)
 {
+  int i, ret;
+
+  for (i = 0; i < cor->conf->nconns; i++)
+  {
+    ret = redis_connect(cor, &cor->conns[i]);
+    if (ret < 0)
+    {
+      fprintf(stderr, "redis_conenct_all: failed to connect to redis\n");
+      return -1;
+    }
+  }
+
+  return 0;
 }
 
 /*****************************************************************************/
@@ -508,14 +723,19 @@ int redis_connect_all(struct core *cor)
 /*****************************************************************************/
 /****************************** Multithreading *******************************/
 
-int start_core(void *arg)
+void *run_core(void *arg)
 {
   int nevs, ret;
   struct epoll_event *evs;
   struct core *cor = arg;
 
   // Open all connections for this core (nonblocking)
-  redis_connect_all(cor);
+  ret = redis_connect_all(cor);
+  if (ret < 0)
+  {
+    fprintf(stderr, "run_core: failed to open all connections\n");
+    abort();
+  }
 
   // Wait for connection and recv events
   nevs = cor->conf->nconns;
@@ -527,11 +747,16 @@ int start_core(void *arg)
     if (ret < 0)
     {
       fprintf(stderr, "start_core: epoll wait failed\n");
-      return -1;
+      abort();
     }
 
     // Process events
-    handle_events(cor, evs, ret);
+    ret = handle_events(cor, evs, ret);
+    if (ret < 0)
+    {
+      fprintf(stderr, "run_core: error when handling events\n");
+      abort();
+    }
   }
 }
 
@@ -542,7 +767,7 @@ int start_cores(struct loadgen *lg)
   for (i = 0; i < lg->conf->ncores; i++)
   {
     ret = pthread_create(&lg->cores[i].pthread, NULL,
-                         start_core, &lg->cores[i]);
+                         run_core, (void *) &lg->cores[i]);
 
     if (ret != 0)
     {
@@ -550,10 +775,14 @@ int start_cores(struct loadgen *lg)
       return -1;
     }
   }
+
+  return 0;
 }
 
 int stop_cores(struct loadgen *lg)
 {
+  printf("stop_cores: duration=%d", lg->conf->duration);
+  return 0;
 }
 
 /*****************************************************************************/
