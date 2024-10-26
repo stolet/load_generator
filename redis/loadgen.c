@@ -22,7 +22,11 @@
 #define DEFAULT_VAL_SIZE 64
 #define DEFAULT_SET_RATIO 1
 #define DEFAULT_GET_RATIO 9
-#define DEFAULT_MAX_PENDING_REQS 1
+#define DEFAULT_NCONNS 1
+#define DEFAULT_NCORES 1
+#define DEFAULT_MAX_PENDING 1
+
+#define MAX(a, b) a > b ? a : b
 
 static int next_core_id = 0;
 
@@ -59,6 +63,8 @@ struct config
   int nconns;
   // Max number of pending requests for each conenction
   int max_pending;
+  // Size of value used in SET commands
+  size_t val_size;
   // Distribution to use to sample keys
   enum dist dist;
 };
@@ -84,8 +90,12 @@ struct conn
   int ratio_i;
   // Max value for ratio i before it loops back to 0
   int ratio_max_i;
-  // Sequential counter used to determine next key in SEQUENTIAL distribution
-  int sequential_counter;
+  // Max value achieved by the sequential counter for set so far
+  int seq_counter_set_max;
+  // Counter used to determine next key in SEQUENTIAL distribution for SET
+  int seq_counter_set;
+  // Counter used to determine next key in SEQUENTIAL distribution for GET
+  int seq_counter_get;
 };
 
 struct core
@@ -115,7 +125,7 @@ struct loadgen
 /*****************************************************************************/
 /******************************** Parsing CMDL *******************************/
 
-void print_usage(const char *prog_name)
+static void print_usage(const char *prog_name)
 {
   printf("Usage: %s [options]                                                             \n"
          "General options:                                                                \n"
@@ -135,7 +145,7 @@ void print_usage(const char *prog_name)
          prog_name, DEFAULT_SET_RATIO, DEFAULT_GET_RATIO);
 }
 
-int parse_args(int argc, char **argv, struct config *conf)
+static int parse_args(int argc, char **argv, struct config *conf)
 {
   int opt;
   int option_index = 0;
@@ -234,18 +244,21 @@ int parse_args(int argc, char **argv, struct config *conf)
 /*****************************************************************************/
 /************************* Initialization procedures *************************/
 
-void init_config(struct config *conf)
+static void init_config(struct config *conf)
 {
   conf->ip = NULL;
   conf->port = 0;
   conf->duration = 0;
+  conf->nconns = DEFAULT_NCONNS;
+  conf->ncores = DEFAULT_NCORES;
   conf->set_ratio = DEFAULT_SET_RATIO;
   conf->get_ratio = DEFAULT_GET_RATIO;
-  conf->max_pending = DEFAULT_MAX_PENDING_REQS;
+  conf->max_pending = DEFAULT_MAX_PENDING;
+  conf->val_size = DEFAULT_VAL_SIZE;
   conf->dist = UNIFORM;
 }
 
-int init_conn(struct config *conf, struct conn *con)
+static int init_conn(struct config *conf, struct conn *con)
 {
   int *set_keys;
   char *tx_buf, *rx_buf;
@@ -280,16 +293,17 @@ int init_conn(struct config *conf, struct conn *con)
   con->set_keys_n = 0;
   con->ratio_i = 0;
   con->ratio_max_i = conf->set_ratio + conf->get_ratio;
-  con->sequential_counter = MIN_KEY;
+  con->seq_counter_set_max = MIN_KEY;
+  con->seq_counter_set = MIN_KEY;
+  con->seq_counter_get = MIN_KEY;
 
   return 0;
 }
 
-int init_core(struct core *cor, struct config *conf)
+static int init_core(struct core *cor, struct config *conf)
 {
   int i, ret, ep;
   struct conn *conns;
-
 
   conns = calloc(conf->nconns, sizeof(struct conn));
   if (conns == NULL)
@@ -319,15 +333,13 @@ int init_core(struct core *cor, struct config *conf)
   cor->conns = conns;
   cor->ep = ep;
   cor->id = next_core_id++;
+
   return 0;
 }
 
-int init_loadgen(struct loadgen *lg, struct config *conf)
+static int init_loadgen(struct loadgen *lg, struct config *conf)
 {
   struct core *cores;
-
-  lg->conf = conf;
-  gettimeofday(&lg->start_time, NULL);
 
   cores = calloc(conf->ncores, sizeof(struct core));
   for (int i = 0; i < conf->ncores; i++)
@@ -335,20 +347,24 @@ int init_loadgen(struct loadgen *lg, struct config *conf)
     init_core(&cores[i], conf);
   }
 
+  lg->conf = conf;
+  lg->cores = cores;
+  gettimeofday(&lg->start_time, NULL);
+
   return 0;
 }
 
 /*****************************************************************************/
 
 /*****************************************************************************/
-/******************************* Key generation ******************************/
+/*************************** Key and val generation **************************/
 
-int sample_uniform(int min, int max)
+static int sample_uniform(int min, int max)
 {
   return rand() % (max - min + 1) + min;
 }
 
-int sample_zipf(int s, int n)
+static int sample_zipf(int s, int n)
 {
   int i;
   double p = (rand() / (RAND_MAX + 1.0));
@@ -366,12 +382,23 @@ int sample_zipf(int s, int n)
   return n;
 }
 
-int sample_sequential(struct conn *con)
+static int sample_sequential_set(struct conn *con)
 {
-  return con->sequential_counter++ % MAX_KEY;
+  con->seq_counter_set = (con->seq_counter_set + 1) % MAX_KEY;
+  con->seq_counter_set_max = MAX(con->seq_counter_set,
+      con->seq_counter_set_max);
+  return con->seq_counter_set;
 }
 
-int generate_key(struct core *cor, struct conn *con)
+static int sample_sequential_get(struct conn *con)
+{
+  fprintf(stderr, "counter_get=%d counter_set=%d\n", con->seq_counter_get, con->seq_counter_set);
+  con->seq_counter_get = (con->seq_counter_get + 1) %
+      con->seq_counter_set_max;
+  return con->seq_counter_get;
+}
+
+static int generate_key_set(struct core *cor, struct conn *con)
 {
   switch (cor->conf->dist)
   {
@@ -380,10 +407,34 @@ int generate_key(struct core *cor, struct conn *con)
   case ZIPFIAN:
     return sample_zipf(1.0, MAX_KEY);
   case SEQUENTIAL:
-    return sample_sequential(con);
+    return sample_sequential_set(con);
   default:
     return sample_uniform(MIN_KEY, MAX_KEY);
   }
+}
+
+static int generate_key_get(struct core *cor, struct conn *con)
+{
+  switch (cor->conf->dist)
+  {
+  case UNIFORM:
+    return sample_uniform(MIN_KEY, MAX_KEY);
+  case ZIPFIAN:
+    return sample_zipf(1.0, MAX_KEY);
+  case SEQUENTIAL:
+    return sample_sequential_get(con);
+  default:
+    return sample_uniform(MIN_KEY, MAX_KEY);
+  }
+}
+
+static void generate_val(char *val, int n)
+{
+  for (int i = 0; i < n; i++)
+  {
+    val[i] = 'a';
+  }
+  val[n] = '\0';
 }
 
 /*****************************************************************************/
@@ -391,14 +442,30 @@ int generate_key(struct core *cor, struct conn *con)
 /*****************************************************************************/
 /********************************** Data path ********************************/
 
-int redis_set(int fd, char *key, size_t key_len, char *val, size_t val_len)
+static int redis_set(struct core *cor, struct conn *con)
 {
+  int key, key_len;
   char buffer[MAX_BUF];
+  char key_str[MAX_BUF];
+  char val[DEFAULT_VAL_SIZE + 1];
 
+  // Generate key from distribution in config
+  key = generate_key_set(cor, con);
+  key_len = snprintf(key_str, MAX_BUF, "%d", key);
+  if (key_len < 0)
+  {
+    fprintf(stderr, "redis_set: snprintf for generating key failed\n");
+  }
+
+  // Add something to set_val or else redis won't give us a response
+  generate_val(val, DEFAULT_VAL_SIZE + 1);
+
+  // Craft SET command
   int len = snprintf(buffer, sizeof(buffer),
                      "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                     key_len, key, val_len, val);
+                     (size_t) key_len, key_str, cor->conf->val_size, val);
 
+  fprintf(stderr, "SET SEND: %s\n", buffer);
   if (len < 0)
   {
     perror("redis_set: snprintf failed for SET command");
@@ -411,7 +478,7 @@ int redis_set(int fd, char *key, size_t key_len, char *val, size_t val_len)
     return -1;
   }
 
-  int ret = send(fd, buffer, len, 0);
+  int ret = send(con->fd, buffer, len, 0);
   if (ret == -1)
   {
     perror("redis_set: failed to send SET command");
@@ -421,13 +488,26 @@ int redis_set(int fd, char *key, size_t key_len, char *val, size_t val_len)
   return 0;
 }
 
-int redis_get(int fd, char *key, size_t key_len)
+static int redis_get(struct core *cor, struct conn *con)
 {
+  int key, key_len;
+  char key_str[MAX_BUF];
   char buffer[MAX_BUF];
 
-  int len = snprintf(buffer, sizeof(buffer),
-                     "*2\r\n$3\r\nGET\r\n$%zu\r\n%s\r\n", key_len, key);
+  // Generate key from distribution given in config
+  key = generate_key_get(cor, con);
+  key_len = snprintf(key_str, MAX_BUF, "%d", key);
+  if (key_len < 0)
+  {
+    fprintf(stderr, "redis_get: snprintf for generating key failed\n");
+  }
 
+  // Craft GET command
+  int len = snprintf(buffer, sizeof(buffer),
+                     "*2\r\n$3\r\nGET\r\n$%zu\r\n%s\r\n",
+                     (size_t) key_len, key_str);
+
+  fprintf(stderr, "GET SEND: %s\n", buffer);
   if (len < 0)
   {
     perror("redis_get: snprintf failed for SET command");
@@ -440,7 +520,7 @@ int redis_get(int fd, char *key, size_t key_len)
     return -1;
   }
 
-  int ret = send(fd, buffer, len, 0);
+  int ret = send(con->fd, buffer, len, 0);
   if (ret == -1)
   {
     perror("redis_get: failed to send GET command");
@@ -450,7 +530,43 @@ int redis_get(int fd, char *key, size_t key_len)
   return 0;
 }
 
-int redis_parse_response(char *buf)
+static int redis_send(struct core *cor, struct conn *con)
+{
+  int ret;
+
+  // Send commands until we reach max pending
+  while (con->pending < cor->conf->max_pending)
+  {
+    if (con->ratio_i < cor->conf->set_ratio)
+    {
+      // Sends SET
+      ret = redis_set(cor, con);
+      if (ret < 0)
+      {
+        fprintf(stderr, "redis_send: sending SET command failed\n");
+        return -1;
+      }
+    }
+    else
+    {
+      // Sends GET
+      ret = redis_get(cor, con);
+      if (ret < 0)
+      {
+        fprintf(stderr, "redis_send: sending GET command failed\n");
+        return -1;
+      }
+    }
+
+    con->ratio_i = (con->ratio_i + 1) % con->ratio_max_i;
+    con->pending++;
+  }
+
+  return 0;
+
+}
+
+static int redis_parse_response(char *buf)
 {
   int ret, str_len;
   char *str_start;
@@ -459,7 +575,7 @@ int redis_parse_response(char *buf)
   {
     case '+':
       // Simple string: SET
-      printf("SET: %s\n", buf);
+      printf("SET RES: %s\n", buf);
       break;
     case '$':
       // Bulk string: GET
@@ -473,7 +589,7 @@ int redis_parse_response(char *buf)
       // Sent a GET for nonexistent key
       if (str_len == -1)
       {
-        printf("GET: nonexistent key\n");
+        printf("GET RES: nonexistent key\n");
         return 0;
       }
 
@@ -485,6 +601,7 @@ int redis_parse_response(char *buf)
       {
         fprintf(stderr, "redis_parse_response: "
             "size of bulk string is incorrect\n");
+        return -1;
       }
 
       // Add trailing 0 so we can print string
@@ -504,7 +621,7 @@ int redis_parse_response(char *buf)
   return 0;
 }
 
-int redis_recv(struct conn *con)
+static int redis_recv(struct conn *con)
 {
   int ret, len;
   char buf[MAX_BUF];
@@ -533,46 +650,7 @@ int redis_recv(struct conn *con)
 
 }
 
-int redis_send(struct core *cor, struct conn *con)
-{
-  int ret;
-  int key, key_len;
-  char key_str[MAX_BUF];
-  char set_val[DEFAULT_VAL_SIZE];
-
-  key = generate_key(cor, con);
-  key_len = snprintf(key_str, MAX_BUF, "%d", key);
-
-  while (con->pending < cor->conf->max_pending)
-  {
-    if (con->ratio_i < cor->conf->set_ratio)
-    {
-      ret = redis_set(con->fd, key_str, key_len, set_val, DEFAULT_VAL_SIZE);
-      if (ret < 0)
-      {
-        fprintf(stderr, "redis_send: sending SET command failed\n");
-        return -1;
-      }
-    }
-    else
-    {
-      ret = redis_get(con->fd, key_str, key_len);
-      if (ret < 0)
-      {
-        fprintf(stderr, "redis_send: sending GET command failed\n");
-        return -1;
-      }
-    }
-
-    con->ratio_i = (con->ratio_i + 1) % con->ratio_max_i;
-    con->pending++;
-  }
-
-  return 0;
-
-}
-
-int handle_events(struct core *cor, struct epoll_event *evs, int n)
+static int handle_events(struct core *cor, struct epoll_event *evs, int n)
 {
   int i, ret, status;
   socklen_t slen;
@@ -581,6 +659,13 @@ int handle_events(struct core *cor, struct epoll_event *evs, int n)
   for (i = 0; i < n; i++)
   {
     con = evs[i].data.ptr;
+
+    // Check for errors on connection
+    if ((evs[i].events & EPOLLERR) != 0)
+    {
+      fprintf(stderr, "handle_events: error on epoll\n");
+      return -1;
+    }
 
     // Check if connection was established
     if (con->status == CONN_CONNECTING)
@@ -607,7 +692,7 @@ int handle_events(struct core *cor, struct epoll_event *evs, int n)
     }
 
     // Check if we received a response
-    if (evs[i].events & EPOLLIN)
+    if ((evs[i].events & EPOLLIN) == EPOLLIN)
     {
       ret = redis_recv(con);
       if (ret < 0)
@@ -636,7 +721,7 @@ int handle_events(struct core *cor, struct epoll_event *evs, int n)
 /*****************************************************************************/
 /******************************** Control Path *******************************/
 
-int redis_connect(struct core *cor, struct conn *con)
+static int redis_connect(struct core *cor, struct conn *con)
 {
   int conn_fd, flags, ret, port;
   const char *ip;
@@ -671,6 +756,8 @@ int redis_connect(struct core *cor, struct conn *con)
   }
 
   // Add socket to epoll
+  ev.data.ptr = con;
+  ev.events = EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLERR;
   ret = epoll_ctl(cor->ep, EPOLL_CTL_ADD, conn_fd, &ev);
   if (ret < 0)
   {
@@ -701,7 +788,7 @@ int redis_connect(struct core *cor, struct conn *con)
   return 0;
 }
 
-int redis_connect_all(struct core *cor)
+static int redis_connect_all(struct core *cor)
 {
   int i, ret;
 
@@ -710,7 +797,7 @@ int redis_connect_all(struct core *cor)
     ret = redis_connect(cor, &cor->conns[i]);
     if (ret < 0)
     {
-      fprintf(stderr, "redis_conenct_all: failed to connect to redis\n");
+      fprintf(stderr, "redis_connect_all: failed to connect to redis\n");
       return -1;
     }
   }
@@ -723,7 +810,7 @@ int redis_connect_all(struct core *cor)
 /*****************************************************************************/
 /****************************** Multithreading *******************************/
 
-void *run_core(void *arg)
+static void *run_core(void *arg)
 {
   int nevs, ret;
   struct epoll_event *evs;
@@ -746,7 +833,7 @@ void *run_core(void *arg)
     ret = epoll_wait(cor->ep, evs, nevs, -1);
     if (ret < 0)
     {
-      fprintf(stderr, "start_core: epoll wait failed\n");
+      fprintf(stderr, "run_core: epoll wait failed\n");
       abort();
     }
 
@@ -758,9 +845,11 @@ void *run_core(void *arg)
       abort();
     }
   }
+
+  return NULL;
 }
 
-int start_cores(struct loadgen *lg)
+static int start_cores(struct loadgen *lg)
 {
   int i, ret;
 
@@ -779,7 +868,7 @@ int start_cores(struct loadgen *lg)
   return 0;
 }
 
-int stop_cores(struct loadgen *lg)
+static int stop_cores(struct loadgen *lg)
 {
   printf("stop_cores: duration=%d", lg->conf->duration);
   return 0;
@@ -790,7 +879,7 @@ int stop_cores(struct loadgen *lg)
 /*****************************************************************************/
 /************************************ Time ***********************************/
 
-long get_time_ms()
+static long get_time_ms()
 {
   struct timeval now;
   gettimeofday(&now, NULL);
