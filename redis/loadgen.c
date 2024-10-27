@@ -19,6 +19,7 @@
 #define MIN_KEY 1
 #define MAX_KEY 10000
 #define MAX_CONNS 1000
+#define DEFAULT_RATE 0
 #define DEFAULT_VAL_SIZE 64
 #define DEFAULT_SET_RATIO 1
 #define DEFAULT_GET_RATIO 9
@@ -27,6 +28,7 @@
 #define DEFAULT_MAX_PENDING 1
 
 #define MAX(a, b) a > b ? a : b
+#define MIN(a, b) a < b ? a : b
 
 static int next_core_id = 0;
 
@@ -53,16 +55,21 @@ struct config
   int port;
   // How long to run loadgen for
   int duration;
+
   // How many SET requests to send compared to GET
   int set_ratio;
   // How many GET requests to send compared to SET
   int get_ratio;
+
   // Number of threads to start
   int ncores;
   // Number of connections to open per core
   int nconns;
   // Max number of pending requests for each conenction
   int max_pending;
+  // Send rate for each connection
+  int rate;
+
   // Size of value used in SET commands
   size_t val_size;
   // Distribution to use to sample keys
@@ -80,10 +87,24 @@ struct conn
   int status;
   // Number of pending requests sent to redis
   int pending;
+
   // Buffer used to transmit requests to redis
   char *tx_buf;
   // Buffer used to received requests from redis
   char *rx_buf;
+
+  // Tokens used by rate limiter
+  int tokens;
+  // Rate at which tokens are added per minute
+  int rate;
+  // Maximum capacity of token bucker
+  int tokens_max;
+  // Last time the tokens were refilled
+  long last_refill;
+
+  // Total number of requests sent by this connection
+  uint64_t nreqs;
+
   // Array of unique set keys sent by this connection
   int *set_keys;
   // Number of unique set keys sent by this connection
@@ -92,6 +113,7 @@ struct conn
   int ratio_i;
   // Max value for ratio i before it loops back to 0
   int ratio_max_i;
+
   // Max value achieved by the sequential counter for set so far
   int seq_counter_set_max;
   // Counter used to determine next key in SEQUENTIAL distribution for SET
@@ -122,6 +144,16 @@ struct loadgen
   struct timeval start_time;
   // Array of cores started by pthread_create
   struct core *cores;
+  // Throughput metrics
+  struct tp_metrics *tpmets;
+  // Index for tp_mets save iteration
+  int i_mets;
+};
+
+struct tp_metrics
+{
+  long ts;
+  uint64_t nreqs;
 };
 
 // Parsing CMDL
@@ -161,7 +193,8 @@ static void *run_core(void *arg);
 static int start_cores(struct loadgen *lg);
 
 // Time
-static long get_time_ms();
+static inline long get_ms();
+static inline uint64_t get_nanos(void);
 
 /*****************************************************************************/
 /******************************** Parsing CMDL *******************************/
@@ -178,6 +211,7 @@ static void print_usage(const char *prog_name)
          "  --nconns   <INT>  Number of connections per core                              \n"
          "  --ncores   <INT>  Number of cores                                             \n"
          "  --pending  <INT>  Max number of requests per connection                       \n"
+         "  --rate     <INT>  Send rate for each connection                               \n"
          "                                                                                \n"
          "Key options:                                                                    \n"
          "  --ratio        <SET:GET>  Ratio of SET and GET commands [default: %d:%d]      \n"
@@ -198,6 +232,7 @@ static int parse_args(int argc, char **argv, struct config *conf)
       {"nconns", required_argument, 0, 0},
       {"ncores", required_argument, 0, 0},
       {"pending", required_argument, 0, 0},
+      {"rate", required_argument, 0, 0},
       {"ratio", required_argument, 0, 0},
       {"distribution", required_argument, 0, 0},
       {0, 0, 0, 0}};
@@ -258,18 +293,22 @@ static int parse_args(int argc, char **argv, struct config *conf)
       {
         conf->duration = atoi(optarg);
       }
-    }
-    else if (strcmp(options[option_index].name, "nconns") == 0)
-    {
-      conf->nconns = atoi(optarg);
-    }
-    else if (strcmp(options[option_index].name, "ncores") == 0)
-    {
-      conf->ncores = atoi(optarg);
-    }
-    else if (strcmp(options[option_index].name, "pending") == 0)
-    {
-      conf->ncores = atoi(optarg);
+      else if (strcmp(options[option_index].name, "nconns") == 0)
+      {
+        conf->nconns = atoi(optarg);
+      }
+      else if (strcmp(options[option_index].name, "ncores") == 0)
+      {
+        conf->ncores = atoi(optarg);
+      }
+      else if (strcmp(options[option_index].name, "pending") == 0)
+      {
+        conf->max_pending = atoi(optarg);
+      }
+      else if (strcmp(options[option_index].name, "rate") == 0)
+      {
+        conf->rate = atoi(optarg);
+      }
     }
     else
     {
@@ -305,6 +344,7 @@ static int init_config(struct config *conf)
   conf->set_ratio = DEFAULT_SET_RATIO;
   conf->get_ratio = DEFAULT_GET_RATIO;
   conf->max_pending = DEFAULT_MAX_PENDING;
+  conf->rate = DEFAULT_RATE;
   conf->val_size = DEFAULT_VAL_SIZE;
   conf->dist = UNIFORM;
   conf->zipf_cdf = zipf_cdf;
@@ -343,6 +383,11 @@ static int init_conn(struct config *conf, struct conn *con)
   con->pending = 0;
   con->tx_buf = tx_buf;
   con->rx_buf = rx_buf;
+  con->tokens = conf->rate;
+  con->rate = conf->rate;
+  con->tokens_max = conf->rate;
+  con->last_refill = get_nanos();
+  con->nreqs = 0;
   con->set_keys = set_keys;
   con->set_keys_n = 0;
   con->ratio_i = 0;
@@ -393,6 +438,7 @@ static int init_core(struct core *cor, struct config *conf)
 
 static int init_loadgen(struct loadgen *lg, struct config *conf)
 {
+  struct tp_metrics *tpmets;
   struct core *cores;
 
   cores = calloc(conf->ncores, sizeof(struct core));
@@ -401,9 +447,20 @@ static int init_loadgen(struct loadgen *lg, struct config *conf)
     init_core(&cores[i], conf);
   }
 
+  // Allocate array to hold throughput metrics
+  tpmets = calloc(conf->duration, sizeof(struct tp_metrics));
+  if (tpmets == NULL)
+  {
+    fprintf(stderr, "main: failed to allocate tp_metrics array\n");
+    exit(-1);
+  }
+
+
   lg->conf = conf;
   lg->cores = cores;
   gettimeofday(&lg->start_time, NULL);
+  lg->tpmets = tpmets;
+  lg->i_mets = 0;
 
   return 0;
 }
@@ -437,7 +494,6 @@ static void gen_zipf_cdf(double *cdf, double s)
   }
 }
 
-// TODO: Fix zipf always return the same value
 static int sample_zipf(double *cdf)
 {
   int i;
@@ -467,7 +523,6 @@ static int sample_sequential_set(struct conn *con)
 
 static int sample_sequential_get(struct conn *con)
 {
-  fprintf(stderr, "counter_get=%d counter_set=%d\n", con->seq_counter_get, con->seq_counter_set);
   con->seq_counter_get = (con->seq_counter_get + 1) %
       con->seq_counter_set_max;
   return con->seq_counter_get;
@@ -515,6 +570,25 @@ static void generate_val(char *val, int n)
 /*****************************************************************************/
 
 /*****************************************************************************/
+/******************************** Rate limiter *******************************/
+
+static void refill_tokens(struct conn *con)
+{
+  int tokens_up;
+  long now;
+
+  now = get_nanos();
+  if ((now - con->last_refill) >= 10000000)
+  {
+    tokens_up = con->tokens + (con->rate * (now - con->last_refill) / 1000000000);
+    con->tokens = MIN(con->tokens_max, tokens_up);
+    con->last_refill = now;
+  }
+}
+
+/*****************************************************************************/
+
+/*****************************************************************************/
 /********************************** Data path ********************************/
 
 static int redis_set(struct core *cor, struct conn *con)
@@ -540,7 +614,7 @@ static int redis_set(struct core *cor, struct conn *con)
                      "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                      (size_t) key_len, key_str, cor->conf->val_size, val);
 
-  fprintf(stderr, "SET SEND: %s\n", buffer);
+  // fprintf(stderr, "SET SEND: %s\n", buffer);
   if (len < 0)
   {
     perror("redis_set: snprintf failed for SET command");
@@ -582,7 +656,7 @@ static int redis_get(struct core *cor, struct conn *con)
                      "*2\r\n$3\r\nGET\r\n$%zu\r\n%s\r\n",
                      (size_t) key_len, key_str);
 
-  fprintf(stderr, "GET SEND: %s\n", buffer);
+  // fprintf(stderr, "GET SEND: %s\n", buffer);
   if (len < 0)
   {
     perror("redis_get: snprintf failed for SET command");
@@ -609,9 +683,15 @@ static int redis_send(struct core *cor, struct conn *con)
 {
   int ret;
 
+  // Refill tokens before sending
+  refill_tokens(con);
+
   // Send commands until we reach max pending
   while (con->pending < cor->conf->max_pending)
   {
+    if (con->tokens <= 0)
+      return 0;
+
     if (con->ratio_i < cor->conf->set_ratio)
     {
       // Sends SET
@@ -635,6 +715,7 @@ static int redis_send(struct core *cor, struct conn *con)
 
     con->ratio_i = (con->ratio_i + 1) % con->ratio_max_i;
     con->pending++;
+    con->tokens--;
   }
 
   return 0;
@@ -650,7 +731,7 @@ static int redis_parse_response(char *buf)
   {
     case '+':
       // Simple string: SET
-      printf("SET RES: %s\n", buf);
+      // printf("SET RES: %s\n", buf);
       break;
     case '$':
       // Bulk string: GET
@@ -664,7 +745,7 @@ static int redis_parse_response(char *buf)
       // Sent a GET for nonexistent key
       if (str_len == -1)
       {
-        printf("GET RES: nonexistent key\n");
+        // printf("GET RES: nonexistent key\n");
         return 0;
       }
 
@@ -680,7 +761,7 @@ static int redis_parse_response(char *buf)
       }
 
       // Add trailing 0 so we can print string
-      printf("GET: %s\n", str_start);
+      // printf("GET: %s\n", str_start);
       break;
     case '-':
       // Error
@@ -719,6 +800,7 @@ static int redis_recv(struct conn *con)
     }
 
     con->pending--;
+    __sync_fetch_and_add(&con->nreqs, 1);
   }
 
   return 0;
@@ -880,6 +962,41 @@ static int redis_connect_all(struct core *cor)
   return 0;
 }
 
+static int redis_close(struct conn *con)
+{
+  int ret;
+
+  ret = close(con->fd);
+  if (ret < 0)
+  {
+    fprintf(stderr, "redis_close: failed to close socket\n");
+    return -1;
+  }
+
+  return 0;
+}
+
+static int redis_close_all(struct loadgen *lg)
+{
+  int i, j, ret;
+
+  for (i = 0; i < lg->conf->ncores; i++)
+  {
+    for (j = 0; j < lg->conf->nconns; j++)
+    {
+      ret = redis_close(&lg->cores[i].conns[j]);
+      if (ret < 0)
+      {
+        fprintf(stderr, "redis_close_all: failed to close conn to redis\n");
+        return -1;
+      }
+    }
+
+  }
+
+  return 0;
+}
+
 /*****************************************************************************/
 
 /*****************************************************************************/
@@ -954,11 +1071,48 @@ static int stop_cores(struct loadgen *lg)
 /*****************************************************************************/
 /************************************ Time ***********************************/
 
-static long get_time_ms()
+static inline long get_ms()
 {
   struct timeval now;
   gettimeofday(&now, NULL);
   return now.tv_sec * 1000 + now.tv_usec / 1000;
+}
+
+static inline uint64_t get_nanos(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t) ts.tv_sec * 1000 * 1000 * 1000 + ts.tv_nsec;
+}
+
+/*****************************************************************************/
+
+/*****************************************************************************/
+/********************************** Metrics **********************************/
+
+static void tp_metrics_save(struct loadgen *lg, long now)
+{
+  int i, j;
+
+  for (i = 0; i < lg->conf->ncores; i++)
+  {
+    for (j = 0; j < lg->conf->nconns; j++)
+    {
+      lg->tpmets[lg->i_mets].nreqs += lg->cores[i].conns[j].nreqs;
+    }
+  }
+
+  fprintf(stderr, "NREQS=%ld I=%d\n", lg->tpmets[lg->i_mets].nreqs, lg->i_mets);
+  lg->tpmets[lg->i_mets].ts = now;
+  lg->i_mets++;
+}
+
+static void summarize_metrics(struct tp_metrics *tpmets, int i_mets)
+{
+  double avg_tp;
+
+  avg_tp = (double) tpmets[i_mets - 1].nreqs / (double) i_mets;
+  fprintf(stderr, "Avg TP: %f reqs/s\n", avg_tp);
 }
 
 /*****************************************************************************/
@@ -966,6 +1120,7 @@ static long get_time_ms()
 int main(int argc, char **argv)
 {
   int ret;
+  long now, last_save;
   struct loadgen lg;
   struct config conf;
 
@@ -1009,12 +1164,24 @@ int main(int argc, char **argv)
   }
 
   // Wait for experiment duration
-  long end_time = get_time_ms() + lg.conf->duration * 1000;
-  while (get_time_ms() < end_time)
+  long end_time = get_ms() + lg.conf->duration * 1000;
+  now = get_ms();
+  last_save = now;
+  while (now < end_time)
   {
+    if ((now - last_save) >= 1000)
+    {
+      tp_metrics_save(&lg, now);
+      last_save = now;
+    }
+    now = get_ms();
   }
 
-  // Get statistics
+  // Close all Redis connections
+  redis_close_all(&lg);
+
+  // Print metrics for experiment run
+  summarize_metrics(lg.tpmets, lg.i_mets);
 
   // Cleanup
   stop_cores(&lg);
