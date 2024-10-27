@@ -67,6 +67,8 @@ struct config
   size_t val_size;
   // Distribution to use to sample keys
   enum dist dist;
+  // CDF used by the zipf distribution
+  double *zipf_cdf;
 };
 ///////////////////////
 
@@ -121,6 +123,45 @@ struct loadgen
   // Array of cores started by pthread_create
   struct core *cores;
 };
+
+// Parsing CMDL
+static void print_usage(const char *prog_name);
+static int parse_args(int argc, char **argv, struct config *conf);
+
+// Initialization procedures
+static int init_config(struct config *conf);
+static int init_conn(struct config *conf, struct conn *con);
+static int init_core(struct core *cor, struct config *conf);
+static int init_loadgen(struct loadgen *lg, struct config *conf);
+
+// Key and val generation
+static int sample_uniform(int min, int max);
+static void gen_zipf_cdf(double *cdf, double s);
+static int sample_zipf(double *cdf);
+static int sample_sequential_set(struct conn *con);
+static int sample_sequential_get(struct conn *con);
+static int generate_key_set(struct core *cor, struct conn *con);
+static int generate_key_get(struct core *cor, struct conn *con);
+static void generate_val(char *val, int n);
+
+// Data path
+static int redis_set(struct core *cor, struct conn *con);
+static int redis_get(struct core *cor, struct conn *con);
+static int redis_send(struct core *cor, struct conn *con);
+static int redis_parse_response(char *buf);
+static int redis_recv(struct conn *con);
+static int handle_events(struct core *cor, struct epoll_event *evs, int n);
+
+// Control path
+static int redis_connect(struct core *cor, struct conn *con);
+static int redis_connect_all(struct core *cor);
+
+// Multithreading
+static void *run_core(void *arg);
+static int start_cores(struct loadgen *lg);
+
+// Time
+static long get_time_ms();
 
 /*****************************************************************************/
 /******************************** Parsing CMDL *******************************/
@@ -244,8 +285,18 @@ static int parse_args(int argc, char **argv, struct config *conf)
 /*****************************************************************************/
 /************************* Initialization procedures *************************/
 
-static void init_config(struct config *conf)
+static int init_config(struct config *conf)
 {
+  double *zipf_cdf;
+
+  zipf_cdf = calloc(MAX_KEY, sizeof(double));
+  if (zipf_cdf == NULL)
+  {
+    fprintf(stderr, "init_config: failed to allocate zipf_cdf\n");
+    return -1;
+  }
+  gen_zipf_cdf(zipf_cdf, 1);
+
   conf->ip = NULL;
   conf->port = 0;
   conf->duration = 0;
@@ -256,6 +307,9 @@ static void init_config(struct config *conf)
   conf->max_pending = DEFAULT_MAX_PENDING;
   conf->val_size = DEFAULT_VAL_SIZE;
   conf->dist = UNIFORM;
+  conf->zipf_cdf = zipf_cdf;
+
+  return 0;
 }
 
 static int init_conn(struct config *conf, struct conn *con)
@@ -364,22 +418,43 @@ static int sample_uniform(int min, int max)
   return rand() % (max - min + 1) + min;
 }
 
-static int sample_zipf(int s, int n)
+static void gen_zipf_cdf(double *cdf, double s)
 {
   int i;
-  double p = (rand() / (RAND_MAX + 1.0));
-  double sum_prob = 0.0;
+  double sum = 0.0, cumu_sum = 0.0;
 
-  for (i = 1; i <= n; i++)
+  // Keys start from 1 so we don't divide by 0
+  for (i = 1; i <= MAX_KEY; i++)
   {
-    sum_prob += (1.0 / pow(i, s));
-    if (p <= sum_prob)
+    sum += 1.0 / pow(i, s);
+  }
+
+  cdf[0] = 0;
+  for (i = 1; i <= MAX_KEY; i++)
+  {
+    cumu_sum += 1.0 / pow(i, s) / sum;
+    cdf[i-1] = cumu_sum;
+  }
+}
+
+// TODO: Fix zipf always return the same value
+static int sample_zipf(double *cdf)
+{
+  int i;
+
+  // Generate number between 0 and 1
+  double r = (double) rand() / RAND_MAX;
+
+  for (i = 1; i < MAX_KEY; i++)
+  {
+    // Find first rank where r is less than the cdf for rank
+    if (r <= cdf[i])
     {
       return i;
     }
   }
 
-  return n;
+  return MAX_KEY;
 }
 
 static int sample_sequential_set(struct conn *con)
@@ -405,7 +480,7 @@ static int generate_key_set(struct core *cor, struct conn *con)
   case UNIFORM:
     return sample_uniform(MIN_KEY, MAX_KEY);
   case ZIPFIAN:
-    return sample_zipf(1.0, MAX_KEY);
+    return sample_zipf(cor->conf->zipf_cdf);
   case SEQUENTIAL:
     return sample_sequential_set(con);
   default:
@@ -420,7 +495,7 @@ static int generate_key_get(struct core *cor, struct conn *con)
   case UNIFORM:
     return sample_uniform(MIN_KEY, MAX_KEY);
   case ZIPFIAN:
-    return sample_zipf(1.0, MAX_KEY);
+    return sample_zipf(cor->conf->zipf_cdf);
   case SEQUENTIAL:
     return sample_sequential_get(con);
   default:
@@ -890,14 +965,21 @@ static long get_time_ms()
 
 int main(int argc, char **argv)
 {
+  int ret;
   struct loadgen lg;
   struct config conf;
 
   srand(time(NULL));
 
   // Get configuration from args
-  init_config(&conf);
-  int ret = parse_args(argc, argv, &conf);
+  ret = init_config(&conf);
+  if (ret < 0)
+  {
+    fprintf(stderr, "main: failed to initialize config\n");
+    exit(-1);
+  }
+
+  ret = parse_args(argc, argv, &conf);
   if (ret < 0)
   {
     fprintf(stderr, "main: failed to parse options\n");
