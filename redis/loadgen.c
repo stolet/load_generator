@@ -16,7 +16,7 @@
 #include <errno.h>
 
 #define MAX_BUF 1024
-#define MIN_KEY 1
+#define MIN_KEY 0
 #define MAX_KEY 10000
 #define MAX_CONNS 1000
 #define DEFAULT_RATE 0
@@ -533,17 +533,27 @@ static int sample_zipf(double *cdf)
 
 static int sample_sequential_set(struct conn *con)
 {
+  int sample;
+
+  sample = con->seq_counter_set;
+
   con->seq_counter_set = (con->seq_counter_set + 1) % MAX_KEY;
   con->seq_counter_set_max = MAX(con->seq_counter_set,
       con->seq_counter_set_max);
-  return con->seq_counter_set;
+
+  return sample;
 }
 
 static int sample_sequential_get(struct conn *con)
 {
+  int sample;
+
+  sample = con->seq_counter_get;
+
   con->seq_counter_get = (con->seq_counter_get + 1) %
       con->seq_counter_set_max;
-  return con->seq_counter_get;
+
+  return sample;
 }
 
 static int generate_key_set(struct core *cor, struct conn *con)
@@ -639,7 +649,7 @@ static int redis_set(struct core *cor, struct conn *con)
                      "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                      (size_t) key_len, key_str, cor->conf->val_size, val);
 
-  // fprintf(stderr, "SET SEND: %s\n", buffer);
+  fprintf(stderr, "SET SEND: %s\n", buffer);
   if (len < 0)
   {
     perror("redis_set: snprintf failed for SET command");
@@ -681,7 +691,7 @@ static int redis_get(struct core *cor, struct conn *con)
                      "*2\r\n$3\r\nGET\r\n$%zu\r\n%s\r\n",
                      (size_t) key_len, key_str);
 
-  // fprintf(stderr, "GET SEND: %s\n", buffer);
+  fprintf(stderr, "GET SEND: %s\n", buffer);
   if (len < 0)
   {
     perror("redis_get: snprintf failed for SET command");
@@ -756,7 +766,7 @@ static int redis_parse_response(char *buf)
   {
     case '+':
       // Simple string: SET
-      // printf("SET RES: %s\n", buf);
+      printf("SET RES: %s\n", buf);
       break;
     case '$':
       // Bulk string: GET
@@ -770,7 +780,7 @@ static int redis_parse_response(char *buf)
       // Sent a GET for nonexistent key
       if (str_len == -1)
       {
-        // printf("GET RES: nonexistent key\n");
+        printf("GET RES: nonexistent key\n");
         return 0;
       }
 
@@ -786,7 +796,7 @@ static int redis_parse_response(char *buf)
       }
 
       // Add trailing 0 so we can print string
-      // printf("GET RES: %s\n", str_start);
+      printf("GET RES: %s\n", str_start);
       break;
     case '-':
       // Error
