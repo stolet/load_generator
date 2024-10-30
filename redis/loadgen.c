@@ -94,13 +94,13 @@ struct conn
   char *rx_buf;
 
   // Tokens used by rate limiter
-  int tokens;
+  uint64_t tokens;
   // Rate at which tokens are added per minute
-  int rate;
+  uint64_t rate;
   // Maximum capacity of token bucker
-  int tokens_max;
+  uint64_t tokens_max;
   // Last time the tokens were refilled
-  long last_refill;
+  uint64_t last_refill;
 
   // Total number of requests sent by this connection
   uint64_t nreqs;
@@ -134,6 +134,8 @@ struct core
   struct conn *conns;
   // Pthread used to start thread
   pthread_t pthread;
+  // Number of cycles per µ second. Used for timekeeping in rate limit
+  uint64_t tsc_per_us;
 };
 
 struct loadgen
@@ -152,7 +154,7 @@ struct loadgen
 
 struct tp_metrics
 {
-  long ts;
+  uint64_t ts;
   uint64_t nreqs;
 };
 
@@ -162,9 +164,12 @@ static int parse_args(int argc, char **argv, struct config *conf);
 
 // Initialization procedures
 static int init_config(struct config *conf);
-static int init_conn(struct config *conf, struct conn *con);
-static int init_core(struct core *cor, struct config *conf);
-static int init_loadgen(struct loadgen *lg, struct config *conf);
+static int init_conn(struct config *conf, struct conn *con,
+    uint64_t tsc_per_us);
+static int init_core(struct core *cor, struct config *conf,
+    uint64_t tsc_per_us);
+static int init_loadgen(struct loadgen *lg, struct config *conf,
+    uint64_t tsc_per_us);
 
 // Key and val generation
 static int sample_uniform(int min, int max);
@@ -193,6 +198,9 @@ static void *run_core(void *arg);
 static int start_cores(struct loadgen *lg);
 
 // Time
+static inline uint64_t get_tsc_calibration();
+static inline uint64_t rdtsc(void);
+static inline uint64_t get_us_tsc(uint64_t tsc_per_us);
 static inline long get_ms();
 static inline uint64_t get_nanos(void);
 
@@ -352,7 +360,8 @@ static int init_config(struct config *conf)
   return 0;
 }
 
-static int init_conn(struct config *conf, struct conn *con)
+static int init_conn(struct config *conf, struct conn *con,
+    uint64_t tsc_per_us)
 {
   int *set_keys;
   char *tx_buf, *rx_buf;
@@ -386,7 +395,7 @@ static int init_conn(struct config *conf, struct conn *con)
   con->tokens = conf->rate;
   con->rate = conf->rate;
   con->tokens_max = conf->rate;
-  con->last_refill = get_nanos();
+  con->last_refill = get_us_tsc(tsc_per_us);
   con->nreqs = 0;
   con->set_keys = set_keys;
   con->set_keys_n = 0;
@@ -399,7 +408,8 @@ static int init_conn(struct config *conf, struct conn *con)
   return 0;
 }
 
-static int init_core(struct core *cor, struct config *conf)
+static int init_core(struct core *cor, struct config *conf,
+    uint64_t tsc_per_us)
 {
   int i, ret, ep;
   struct conn *conns;
@@ -413,7 +423,7 @@ static int init_core(struct core *cor, struct config *conf)
 
   for (i = 0; i < conf->nconns; i++)
   {
-    ret = init_conn(conf, &conns[i]);
+    ret = init_conn(conf, &conns[i], tsc_per_us);
     if (ret < 0)
     {
       fprintf(stderr, "init_core: failed to initialize connection\n");
@@ -432,27 +442,35 @@ static int init_core(struct core *cor, struct config *conf)
   cor->conns = conns;
   cor->ep = ep;
   cor->id = next_core_id++;
+  cor->tsc_per_us = tsc_per_us;
 
   return 0;
 }
 
-static int init_loadgen(struct loadgen *lg, struct config *conf)
+static int init_loadgen(struct loadgen *lg, struct config *conf,
+    uint64_t tsc_per_us)
 {
+  int ret;
   struct tp_metrics *tpmets;
   struct core *cores;
 
   cores = calloc(conf->ncores, sizeof(struct core));
   for (int i = 0; i < conf->ncores; i++)
   {
-    init_core(&cores[i], conf);
+    ret = init_core(&cores[i], conf, tsc_per_us);
+    if (ret < 0)
+    {
+      fprintf(stderr, "init_loadgen: failed to init core=%d\n", i);
+      return -1;
+    }
   }
 
   // Allocate array to hold throughput metrics
   tpmets = calloc(conf->duration, sizeof(struct tp_metrics));
   if (tpmets == NULL)
   {
-    fprintf(stderr, "main: failed to allocate tp_metrics array\n");
-    exit(-1);
+    fprintf(stderr, "init_loadgen: failed to allocate tp_metrics array\n");
+    return -1;
   }
 
 
@@ -572,17 +590,24 @@ static void generate_val(char *val, int n)
 /*****************************************************************************/
 /******************************** Rate limiter *******************************/
 
-static void refill_tokens(struct conn *con)
+static void refill_tokens(struct conn *con, uint64_t tsc_per_us)
 {
-  int tokens_up;
-  long now;
+  uint64_t tokens_up;
+  uint64_t now;
 
-  now = get_nanos();
-  if ((now - con->last_refill) >= 10000000)
+  now = get_us_tsc(tsc_per_us);
+  if ((now - con->last_refill) >= 1000)
   {
-    tokens_up = con->tokens + (con->rate * (now - con->last_refill) / 1000000000);
-    con->tokens = MIN(con->tokens_max, tokens_up);
-    con->last_refill = now;
+    tokens_up = con->tokens + (con->rate * (now - con->last_refill) / 1000000);
+
+    /* Check if tokens to add > 0 because if rate is too small and
+     * the update period is too short we don't add any new tokens
+     */
+    if (tokens_up > 0)
+    {
+      con->tokens = MIN(con->tokens_max, tokens_up);
+      con->last_refill = now;
+    }
   }
 }
 
@@ -684,7 +709,7 @@ static int redis_send(struct core *cor, struct conn *con)
   int ret;
 
   // Refill tokens before sending
-  refill_tokens(con);
+  refill_tokens(con, cor->tsc_per_us);
 
   // Send commands until we reach max pending
   while (con->pending < cor->conf->max_pending)
@@ -761,7 +786,7 @@ static int redis_parse_response(char *buf)
       }
 
       // Add trailing 0 so we can print string
-      // printf("GET: %s\n", str_start);
+      // printf("GET RES: %s\n", str_start);
       break;
     case '-':
       // Error
@@ -1071,6 +1096,47 @@ static int stop_cores(struct loadgen *lg)
 /*****************************************************************************/
 /************************************ Time ***********************************/
 
+static inline uint64_t get_tsc_calibration()
+{
+  struct timespec ts_before, ts_after;
+  uint64_t tsc, tsc_per_us;
+  double freq;
+
+  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts_before) != 0)
+  {
+    fprintf(stderr, "get_tsc_calibration: clock_gettime failed for ts_before\n");
+    return 0;
+  }
+
+  tsc = rdtsc();
+  usleep(10000);
+  tsc = rdtsc() - tsc;
+
+  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts_after) != 0)
+  {
+    fprintf(stderr, "get_tsc_calibration: clock_gettime failed for ts_after\n");
+    return 0;
+  }
+
+  freq = ((ts_after.tv_sec * 1000000UL) + (ts_after.tv_nsec / 1000)) -
+      ((ts_before.tv_sec * 1000000UL) + (ts_before.tv_nsec / 1000));
+
+  tsc_per_us = tsc / freq;
+  return tsc_per_us;
+}
+
+static inline uint64_t rdtsc(void)
+{
+    uint32_t eax, edx;
+    asm volatile ("rdtsc" : "=a" (eax), "=d" (edx));
+    return ((uint64_t) edx << 32) | eax;
+}
+
+static inline uint64_t get_us_tsc(uint64_t tsc_per_us)
+{
+  return rdtsc() / tsc_per_us;
+}
+
 static inline long get_ms()
 {
   struct timeval now;
@@ -1090,7 +1156,7 @@ static inline uint64_t get_nanos(void)
 /*****************************************************************************/
 /********************************** Metrics **********************************/
 
-static void tp_metrics_save(struct loadgen *lg, long now)
+static void tp_metrics_save(struct loadgen *lg, uint64_t now)
 {
   int i, j;
 
@@ -1120,11 +1186,19 @@ static void summarize_metrics(struct tp_metrics *tpmets, int i_mets)
 int main(int argc, char **argv)
 {
   int ret;
-  long now, last_save;
+  uint64_t now, last_save, tsc_per_us;
   struct loadgen lg;
   struct config conf;
 
   srand(time(NULL));
+
+  // Get calibration for tsc
+  tsc_per_us = get_tsc_calibration();
+  if (tsc_per_us == 0)
+  {
+    fprintf(stderr, "main: failed to get tsc calibration\n");
+    exit(-1);
+  }
 
   // Get configuration from args
   ret = init_config(&conf);
@@ -1148,7 +1222,7 @@ int main(int argc, char **argv)
   }
 
   // Initialize load generator
-  ret = init_loadgen(&lg, &conf);
+  ret = init_loadgen(&lg, &conf, tsc_per_us);
   if (ret < 0)
   {
     fprintf(stderr, "main: failed to init loadgen\n");
@@ -1164,17 +1238,17 @@ int main(int argc, char **argv)
   }
 
   // Wait for experiment duration
-  long end_time = get_ms() + lg.conf->duration * 1000;
-  now = get_ms();
+  uint64_t end_time = get_us_tsc(tsc_per_us) + lg.conf->duration * 1000000;
+  now = get_us_tsc(tsc_per_us);
   last_save = now;
   while (now < end_time)
   {
-    if ((now - last_save) >= 1000)
+    if ((now - last_save) >= 1000000)
     {
       tp_metrics_save(&lg, now);
       last_save = now;
     }
-    now = get_ms();
+    now = get_us_tsc(tsc_per_us);
   }
 
   // Close all Redis connections
