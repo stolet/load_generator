@@ -649,7 +649,7 @@ static int redis_set(struct core *cor, struct conn *con)
                      "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
                      (size_t) key_len, key_str, cor->conf->val_size, val);
 
-  fprintf(stderr, "SET SEND: %s\n", buffer);
+  // fprintf(stderr, "SET SEND: %s\n", buffer);
   if (len < 0)
   {
     perror("redis_set: snprintf failed for SET command");
@@ -691,7 +691,7 @@ static int redis_get(struct core *cor, struct conn *con)
                      "*2\r\n$3\r\nGET\r\n$%zu\r\n%s\r\n",
                      (size_t) key_len, key_str);
 
-  fprintf(stderr, "GET SEND: %s\n", buffer);
+  // fprintf(stderr, "GET SEND: %s\n", buffer);
   if (len < 0)
   {
     perror("redis_get: snprintf failed for SET command");
@@ -719,12 +719,13 @@ static int redis_send(struct core *cor, struct conn *con)
   int ret;
 
   // Refill tokens before sending
-  refill_tokens(con, cor->tsc_per_us);
+  if (con->rate != 0)
+    refill_tokens(con, cor->tsc_per_us);
 
   // Send commands until we reach max pending
   while (con->pending < cor->conf->max_pending)
   {
-    if (con->tokens <= 0)
+    if (con->rate != 0 && con->tokens <= 0)
       return 0;
 
     if (con->ratio_i < cor->conf->set_ratio)
@@ -766,7 +767,7 @@ static int redis_parse_response(char *buf)
   {
     case '+':
       // Simple string: SET
-      printf("SET RES: %s\n", buf);
+      // printf("SET RES: %s\n", buf);
       break;
     case '$':
       // Bulk string: GET
@@ -780,7 +781,7 @@ static int redis_parse_response(char *buf)
       // Sent a GET for nonexistent key
       if (str_len == -1)
       {
-        printf("GET RES: nonexistent key\n");
+        // printf("GET RES: nonexistent key\n");
         return 0;
       }
 
@@ -796,7 +797,7 @@ static int redis_parse_response(char *buf)
       }
 
       // Add trailing 0 so we can print string
-      printf("GET RES: %s\n", str_start);
+      // printf("GET RES: %s\n", str_start);
       break;
     case '-':
       // Error
@@ -1097,7 +1098,19 @@ static int start_cores(struct loadgen *lg)
 
 static int stop_cores(struct loadgen *lg)
 {
-  printf("stop_cores: duration=%d", lg->conf->duration);
+  int i, ret;
+
+  for (i = 0; i < lg->conf->ncores; i++)
+  {
+    ret = pthread_cancel(lg->cores[i].pthread);
+
+    if (ret != 0)
+    {
+      fprintf(stderr, "stop_cores: pthread_cancel failed ret=%d\n", ret);
+      return -1;
+    }
+  }
+
   return 0;
 }
 
@@ -1261,14 +1274,14 @@ int main(int argc, char **argv)
     now = get_us_tsc(tsc_per_us);
   }
 
+  // Kill running threads
+  stop_cores(&lg);
+
   // Close all Redis connections
   redis_close_all(&lg);
 
   // Print metrics for experiment run
   summarize_metrics(lg.tpmets, lg.i_mets);
-
-  // Cleanup
-  stop_cores(&lg);
 
   return 0;
 }
