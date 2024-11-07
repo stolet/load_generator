@@ -15,10 +15,17 @@
 #include <sys/epoll.h>
 #include <errno.h>
 
-#define MAX_BUF 1024
+#define RES_SSTRING '+'
+#define RES_BSTRING '$'
+#define RES_ERROR '-'
+
 #define MIN_KEY 0
 #define MAX_KEY 10000
-#define MAX_CONNS 1000
+#define MAX_LEN_CHARS 8
+#define MAX_BUF 16384
+#define MAX_VAL_SIZE 16384
+
+
 #define DEFAULT_RATE 0
 #define DEFAULT_VAL_SIZE 64
 #define DEFAULT_SET_RATIO 1
@@ -29,6 +36,15 @@
 
 #define MAX(a, b) a > b ? a : b
 #define MIN(a, b) a < b ? a : b
+
+enum parsing_status
+{
+  PARSING_ERR,
+  PARSING_OP,
+  PARSING_LEN,
+  PARSING_VAL,
+  PARSING_COMPLETE
+};
 
 static int next_core_id = 0;
 
@@ -67,11 +83,11 @@ struct config
   int nconns;
   // Max number of pending requests for each conenction
   int max_pending;
+  // Value size for SET requests
+  size_t vsize;
   // Send rate for each connection
   int rate;
 
-  // Size of value used in SET commands
-  size_t val_size;
   // Distribution to use to sample keys
   enum dist dist;
   // CDF used by the zipf distribution
@@ -90,8 +106,19 @@ struct conn
 
   // Buffer used to transmit requests to redis
   char *tx_buf;
+
   // Buffer used to received requests from redis
   char *rx_buf;
+  // Number of bytes read into rx_buf
+  int rx_nread;
+  // Index to rx_buf
+  int rx_i;
+  // Number of expected characters in value for response
+  int rx_nval;
+  // Number of characters parsed in value for response
+  int rx_parsed;
+  // Parsing status of rx response
+  enum parsing_status rx_status;
 
   // Tokens used by rate limiter
   uint64_t tokens;
@@ -185,7 +212,10 @@ static void generate_val(char *val, int n);
 static int redis_set(struct core *cor, struct conn *con);
 static int redis_get(struct core *cor, struct conn *con);
 static int redis_send(struct core *cor, struct conn *con);
-static int redis_parse_response(char *buf);
+static int redis_parse_op(struct conn *con);
+static int redis_parse_len(struct conn *con);
+static int redis_parse_val(struct conn *con);
+static int redis_parse_response(struct conn *con);
 static int redis_recv(struct conn *con);
 static int handle_events(struct core *cor, struct epoll_event *evs, int n);
 
@@ -216,10 +246,11 @@ static void print_usage(const char *prog_name)
          "  --duration <INT>   Number of seconds to run                                   \n"
          "                                                                                \n"
          "Load options:                                                                   \n"
-         "  --nconns   <INT>  Number of connections per core                              \n"
-         "  --ncores   <INT>  Number of cores                                             \n"
-         "  --pending  <INT>  Max number of requests per connection                       \n"
-         "  --rate     <INT>  Send rate for each connection                               \n"
+         "  --nconns       <INT>  Number of connections per core                          \n"
+         "  --ncores       <INT>  Number of cores                                         \n"
+         "  --pending      <INT>  Max number of requests per connection                   \n"
+         "  --vsize       <INT>  Value size for set requests                              \n"
+         "  --rate         <INT>  Send rate for each connection                           \n"
          "                                                                                \n"
          "Key options:                                                                    \n"
          "  --ratio        <SET:GET>  Ratio of SET and GET commands [default: %d:%d]      \n"
@@ -240,6 +271,7 @@ static int parse_args(int argc, char **argv, struct config *conf)
       {"nconns", required_argument, 0, 0},
       {"ncores", required_argument, 0, 0},
       {"pending", required_argument, 0, 0},
+      {"vsize", required_argument, 0, 0},
       {"rate", required_argument, 0, 0},
       {"ratio", required_argument, 0, 0},
       {"distribution", required_argument, 0, 0},
@@ -313,6 +345,10 @@ static int parse_args(int argc, char **argv, struct config *conf)
       {
         conf->max_pending = atoi(optarg);
       }
+      else if (strcmp(options[option_index].name, "vsize") == 0)
+      {
+        conf->vsize = atoi(optarg);
+      }
       else if (strcmp(options[option_index].name, "rate") == 0)
       {
         conf->rate = atoi(optarg);
@@ -352,8 +388,8 @@ static int init_config(struct config *conf)
   conf->set_ratio = DEFAULT_SET_RATIO;
   conf->get_ratio = DEFAULT_GET_RATIO;
   conf->max_pending = DEFAULT_MAX_PENDING;
+  conf->vsize = DEFAULT_VAL_SIZE;
   conf->rate = DEFAULT_RATE;
-  conf->val_size = DEFAULT_VAL_SIZE;
   conf->dist = UNIFORM;
   conf->zipf_cdf = zipf_cdf;
 
@@ -392,6 +428,11 @@ static int init_conn(struct config *conf, struct conn *con,
   con->pending = 0;
   con->tx_buf = tx_buf;
   con->rx_buf = rx_buf;
+  con->rx_nread = 0;
+  con->rx_i = 0;
+  con->rx_nval = 0;
+  con->rx_parsed = 0;
+  con->rx_status = PARSING_OP;
   con->tokens = conf->rate;
   con->rate = conf->rate;
   con->tokens_max = conf->rate;
@@ -631,7 +672,7 @@ static int redis_set(struct core *cor, struct conn *con)
   int key, key_len;
   char buffer[MAX_BUF];
   char key_str[MAX_BUF];
-  char val[DEFAULT_VAL_SIZE + 1];
+  char val[MAX_VAL_SIZE + 1];
 
   // Generate key from distribution in config
   key = generate_key_set(cor, con);
@@ -642,12 +683,12 @@ static int redis_set(struct core *cor, struct conn *con)
   }
 
   // Add something to set_val or else redis won't give us a response
-  generate_val(val, DEFAULT_VAL_SIZE + 1);
+  generate_val(val, cor->conf->vsize + 1);
 
   // Craft SET command
   int len = snprintf(buffer, sizeof(buffer),
                      "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                     (size_t) key_len, key_str, cor->conf->val_size, val);
+                     (size_t) key_len, key_str, cor->conf->vsize, val);
 
   // fprintf(stderr, "SET SEND: %s\n", buffer);
   if (len < 0)
@@ -694,13 +735,13 @@ static int redis_get(struct core *cor, struct conn *con)
   // fprintf(stderr, "GET SEND: %s\n", buffer);
   if (len < 0)
   {
-    perror("redis_get: snprintf failed for SET command");
+    perror("redis_get: snprintf failed for GET command");
     return -1;
   }
 
   if (len > MAX_BUF)
   {
-    perror("redis_get: buffer too small SET command");
+    perror("redis_get: buffer too small for GET command");
     return -1;
   }
 
@@ -758,54 +799,105 @@ static int redis_send(struct core *cor, struct conn *con)
 
 }
 
-static int redis_parse_response(char *buf)
+static int redis_parse_op(struct conn *con)
 {
-  int ret, str_len;
-  char *str_start;
-  // Parse first character to determine type of response
-  switch (buf[0])
+  switch (con->rx_buf[con->rx_i])
   {
-    case '+':
-      // Simple string: SET
-      // printf("SET RES: %s\n", buf);
+    case RES_SSTRING:
+      con->rx_status = PARSING_VAL;
       break;
-    case '$':
-      // Bulk string: GET
-      ret = sscanf(buf + 1, "%d\r\n", &str_len);
-      if (ret != 1)
-      {
-        fprintf(stderr, "redis_parse_response: failed to get str_len\n");
-        return -1;
-      }
-
-      // Sent a GET for nonexistent key
-      if (str_len == -1)
-      {
-        // printf("GET RES: nonexistent key\n");
-        return 0;
-      }
-
-      // Find the start of the bulk string
-      str_start = strstr(buf, "\r\n") + 2;
-
-      // Check if str_len + trailing \r\n matches bulk string
-      if (strlen(str_start) < (size_t) (str_len + 2))
-      {
-        fprintf(stderr, "redis_parse_response: "
-            "size of bulk string is incorrect\n");
-        return -1;
-      }
-
-      // Add trailing 0 so we can print string
-      // printf("GET RES: %s\n", str_start);
+    case RES_BSTRING:
+      con->rx_status = PARSING_LEN;
       break;
-    case '-':
-      // Error
-      fprintf(stderr, "redis_parse_response: incorrect command\n");
+    case RES_ERROR:
+      fprintf(stderr, "redis_parse_op: incorrect command\n");
+      con->rx_i += 1;
+      con->rx_status = PARSING_ERR;
       return -1;
       break;
     default:
-      fprintf(stderr, "redis_parse_response: unknow response type\n");
+      fprintf(stderr, "redis_parse_op: unknown reponse type\n");
+      con->rx_i += 1;
+      con->rx_status = PARSING_ERR;
+      return -1;
+      break;
+  }
+
+  con->rx_i += 1;
+  return 0;
+}
+
+static int redis_parse_len(struct conn *con)
+{
+  char lenstr[MAX_LEN_CHARS];
+  int rflag;
+
+  rflag = 0;
+  for (;con->rx_i < con->rx_nread; con->rx_i++)
+  {
+    if (con->rx_buf[con->rx_i] == '\r')
+    {
+      rflag = 1;
+    }
+    else if (rflag && con->rx_buf[con->rx_i] == '\n')
+    {
+      con->rx_buf[con->rx_i - 1] = '\0';
+      con->rx_nval = atoi(lenstr);
+      con->rx_status = PARSING_VAL;
+      return 0;
+    }
+    else
+    {
+      lenstr[con->rx_i] = con->rx_buf[con->rx_i];
+    }
+  }
+
+  return 0;
+}
+
+static int redis_parse_val(struct conn *con)
+{
+  int rflag;
+
+  rflag = 0;
+  for (;con->rx_i < con->rx_nread; con->rx_i++)
+  {
+    con->rx_parsed += 1;
+    if (con->rx_buf[con->rx_i] == '\r')
+    {
+      rflag = 1;
+    }
+    else if (rflag && con->rx_buf[con->rx_i] == '\n')
+    {
+      con->rx_status = PARSING_COMPLETE;
+      // Increment to account for null char
+      con->rx_i++;
+      return 0;
+    }
+  }
+
+  return 0;
+}
+
+static int redis_parse_response(struct conn *con)
+{
+  switch (con->rx_status)
+  {
+    case PARSING_OP:
+      redis_parse_op(con);
+      break;
+    case PARSING_LEN:
+      redis_parse_len(con);
+      break;
+    case PARSING_VAL:
+      redis_parse_val(con);
+      break;
+    case PARSING_ERR:
+      fprintf(stderr, "redis_recv: sent unknown command\n");
+      return -1;
+      break;
+    default:
+      fprintf(stderr, "redis_recv: got unknown parsing status\n");
       return -1;
       break;
   }
@@ -815,32 +907,40 @@ static int redis_parse_response(char *buf)
 
 static int redis_recv(struct conn *con)
 {
-  int ret, len;
-  char buf[MAX_BUF];
+  int ret;
 
   while (con->pending > 0)
   {
-    len = recv(con->fd, buf, sizeof(buf), 0);
-    if (len < 0)
-    {
-      perror("redis_recv: error when calling recv");
-    }
-
-    // Add null terminator to string
-    buf[len] = '\0';
-    ret = redis_parse_response(buf);
+    ret = recv(con->fd, con->rx_buf, MAX_BUF, 0);
     if (ret < 0)
     {
-      fprintf(stderr, "redis_recv: failed to parse redis response\n");
+      perror("redis_recv: error when calling recv");
       return -1;
     }
 
-    con->pending--;
-    __sync_fetch_and_add(&con->nreqs, 1);
+    if (ret == 0)
+      return 0;
+
+    con->rx_nread = ret;
+    con->rx_i = 0;
+
+    while (con->rx_i < con->rx_nread)
+    {
+      redis_parse_response(con);
+      if (con->rx_status == PARSING_COMPLETE)
+      {
+        con->pending--;
+        __sync_fetch_and_add(&con->nreqs, 1);
+        con->rx_status = PARSING_OP;
+      }
+
+    }
+
+    con->rx_i = 0;
+    con->rx_nread = 0;
   }
 
   return 0;
-
 }
 
 static int handle_events(struct core *cor, struct epoll_event *evs, int n)
