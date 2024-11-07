@@ -25,7 +25,6 @@
 #define MAX_BUF 16384
 #define MAX_VAL_SIZE 16384
 
-
 #define DEFAULT_RATE 0
 #define DEFAULT_VAL_SIZE 64
 #define DEFAULT_SET_RATIO 1
@@ -33,6 +32,9 @@
 #define DEFAULT_NCONNS 1
 #define DEFAULT_NCORES 1
 #define DEFAULT_MAX_PENDING 1
+
+#define HIST_BUCKETS 200000
+#define HIST_PERCENTILES 5
 
 #define MAX(a, b) a > b ? a : b
 #define MIN(a, b) a < b ? a : b
@@ -106,6 +108,8 @@ struct conn
 
   // Buffer used to transmit requests to redis
   char *tx_buf;
+  // Timestamp when request was sent. Used to compute latency.
+  uint64_t tx_ts;
 
   // Buffer used to received requests from redis
   char *rx_buf;
@@ -155,14 +159,26 @@ struct core
   int id;
   // Epoll fd used to wait for events
   int ep;
-  // Configuration parameters
-  struct config *conf;
+  // Loadgen: READ ONLY
+  struct loadgen *lg;
   // Array of connections for this core
   struct conn *conns;
   // Pthread used to start thread
   pthread_t pthread;
   // Number of cycles per µ second. Used for timekeeping in rate limit
   uint64_t tsc_per_us;
+};
+
+struct tp_metrics
+{
+  uint64_t ts;
+  uint64_t nreqs;
+};
+
+struct lat_metrics
+{
+  double percentiles[HIST_PERCENTILES];
+  uint64_t latencies[HIST_PERCENTILES];
 };
 
 struct loadgen
@@ -173,16 +189,14 @@ struct loadgen
   struct timeval start_time;
   // Array of cores started by pthread_create
   struct core *cores;
-  // Throughput metrics
+  // Throughput metrics array for each second
   struct tp_metrics *tpmets;
+  // Latency metrics
+  struct lat_metrics latmets;
   // Index for tp_mets save iteration
   int i_mets;
-};
-
-struct tp_metrics
-{
-  uint64_t ts;
-  uint64_t nreqs;
+  // Latency histogram
+  uint32_t *lat_hist;
 };
 
 // Parsing CMDL
@@ -193,8 +207,9 @@ static int parse_args(int argc, char **argv, struct config *conf);
 static int init_config(struct config *conf);
 static int init_conn(struct config *conf, struct conn *con,
     uint64_t tsc_per_us);
-static int init_core(struct core *cor, struct config *conf,
-    uint64_t tsc_per_us);
+static int init_core(struct core *cor, struct loadgen *lg,
+    struct config *conf, uint64_t tsc_per_us);
+static void init_latmets(struct lat_metrics *latmets);
 static int init_loadgen(struct loadgen *lg, struct config *conf,
     uint64_t tsc_per_us);
 
@@ -216,7 +231,7 @@ static int redis_parse_op(struct conn *con);
 static int redis_parse_len(struct conn *con);
 static int redis_parse_val(struct conn *con);
 static int redis_parse_response(struct conn *con);
-static int redis_recv(struct conn *con);
+static int redis_recv(struct core *cor, struct conn *con);
 static int handle_events(struct core *cor, struct epoll_event *evs, int n);
 
 // Control path
@@ -233,6 +248,12 @@ static inline uint64_t rdtsc(void);
 static inline uint64_t get_us_tsc(uint64_t tsc_per_us);
 static inline long get_ms();
 static inline uint64_t get_nanos(void);
+
+// Metrics
+static void tp_metrics_save(struct loadgen *lg, uint64_t now);
+static void summarize_metrics(struct loadgen *lg, int i_mets);
+static void latency_add(struct loadgen *lg, uint64_t lat);
+
 
 /*****************************************************************************/
 /******************************** Parsing CMDL *******************************/
@@ -449,8 +470,8 @@ static int init_conn(struct config *conf, struct conn *con,
   return 0;
 }
 
-static int init_core(struct core *cor, struct config *conf,
-    uint64_t tsc_per_us)
+static int init_core(struct core *cor, struct loadgen *lg,
+    struct config *conf, uint64_t tsc_per_us)
 {
   int i, ret, ep;
   struct conn *conns;
@@ -479,7 +500,7 @@ static int init_core(struct core *cor, struct config *conf,
     return -1;
   }
 
-  cor->conf = conf;
+  cor->lg = lg;
   cor->conns = conns;
   cor->ep = ep;
   cor->id = next_core_id++;
@@ -488,17 +509,30 @@ static int init_core(struct core *cor, struct config *conf,
   return 0;
 }
 
+static void init_latmets(struct lat_metrics *latmets)
+{
+  int i;
+  double percentiles[HIST_PERCENTILES] = {0.50,0.90,0.99,0.999,0.9999};
+
+  for (i = 0; i < HIST_PERCENTILES; i++)
+  {
+    latmets->latencies[i] = 0;
+    latmets->percentiles[i] = percentiles[i];
+  }
+}
+
 static int init_loadgen(struct loadgen *lg, struct config *conf,
     uint64_t tsc_per_us)
 {
   int ret;
+  uint32_t *hist;
   struct tp_metrics *tpmets;
   struct core *cores;
 
   cores = calloc(conf->ncores, sizeof(struct core));
   for (int i = 0; i < conf->ncores; i++)
   {
-    ret = init_core(&cores[i], conf, tsc_per_us);
+    ret = init_core(&cores[i], lg, conf, tsc_per_us);
     if (ret < 0)
     {
       fprintf(stderr, "init_loadgen: failed to init core=%d\n", i);
@@ -514,12 +548,23 @@ static int init_loadgen(struct loadgen *lg, struct config *conf,
     return -1;
   }
 
+  // Initialize arrays to get latency percentiles
+  init_latmets(&lg->latmets);
+
+  // Allocate latency histogram
+  hist = calloc(HIST_BUCKETS, sizeof(*hist));
+  if (hist == NULL)
+  {
+    fprintf(stderr, "init_loadgen: failed to allocate latency histogram\n");
+  }
+  memset(hist, 0, HIST_BUCKETS * sizeof(*hist));
 
   lg->conf = conf;
   lg->cores = cores;
   gettimeofday(&lg->start_time, NULL);
   lg->tpmets = tpmets;
   lg->i_mets = 0;
+  lg->lat_hist = hist;
 
   return 0;
 }
@@ -599,12 +644,12 @@ static int sample_sequential_get(struct conn *con)
 
 static int generate_key_set(struct core *cor, struct conn *con)
 {
-  switch (cor->conf->dist)
+  switch (cor->lg->conf->dist)
   {
   case UNIFORM:
     return sample_uniform(MIN_KEY, MAX_KEY);
   case ZIPFIAN:
-    return sample_zipf(cor->conf->zipf_cdf);
+    return sample_zipf(cor->lg->conf->zipf_cdf);
   case SEQUENTIAL:
     return sample_sequential_set(con);
   default:
@@ -614,12 +659,12 @@ static int generate_key_set(struct core *cor, struct conn *con)
 
 static int generate_key_get(struct core *cor, struct conn *con)
 {
-  switch (cor->conf->dist)
+  switch (cor->lg->conf->dist)
   {
   case UNIFORM:
     return sample_uniform(MIN_KEY, MAX_KEY);
   case ZIPFIAN:
-    return sample_zipf(cor->conf->zipf_cdf);
+    return sample_zipf(cor->lg->conf->zipf_cdf);
   case SEQUENTIAL:
     return sample_sequential_get(con);
   default:
@@ -683,12 +728,12 @@ static int redis_set(struct core *cor, struct conn *con)
   }
 
   // Add something to set_val or else redis won't give us a response
-  generate_val(val, cor->conf->vsize + 1);
+  generate_val(val, cor->lg->conf->vsize + 1);
 
   // Craft SET command
   int len = snprintf(buffer, sizeof(buffer),
                      "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                     (size_t) key_len, key_str, cor->conf->vsize, val);
+                     (size_t) key_len, key_str, cor->lg->conf->vsize, val);
 
   // fprintf(stderr, "SET SEND: %s\n", buffer);
   if (len < 0)
@@ -703,6 +748,7 @@ static int redis_set(struct core *cor, struct conn *con)
     return -1;
   }
 
+  con->tx_ts = get_us_tsc(cor->tsc_per_us);
   int ret = send(con->fd, buffer, len, 0);
   if (ret == -1)
   {
@@ -745,6 +791,7 @@ static int redis_get(struct core *cor, struct conn *con)
     return -1;
   }
 
+  con->tx_ts = get_us_tsc(cor->tsc_per_us);
   int ret = send(con->fd, buffer, len, 0);
   if (ret == -1)
   {
@@ -764,12 +811,12 @@ static int redis_send(struct core *cor, struct conn *con)
     refill_tokens(con, cor->tsc_per_us);
 
   // Send commands until we reach max pending
-  while (con->pending < cor->conf->max_pending)
+  while (con->pending < cor->lg->conf->max_pending)
   {
     if (con->rate != 0 && con->tokens <= 0)
       return 0;
 
-    if (con->ratio_i < cor->conf->set_ratio)
+    if (con->ratio_i < cor->lg->conf->set_ratio)
     {
       // Sends SET
       ret = redis_set(cor, con);
@@ -905,7 +952,7 @@ static int redis_parse_response(struct conn *con)
   return 0;
 }
 
-static int redis_recv(struct conn *con)
+static int redis_recv(struct core *cor, struct conn *con)
 {
   int ret;
 
@@ -930,6 +977,7 @@ static int redis_recv(struct conn *con)
       if (con->rx_status == PARSING_COMPLETE)
       {
         con->pending--;
+        latency_add(cor->lg, get_us_tsc(cor->tsc_per_us) - con->tx_ts);
         __sync_fetch_and_add(&con->nreqs, 1);
         con->rx_status = PARSING_OP;
       }
@@ -987,7 +1035,7 @@ static int handle_events(struct core *cor, struct epoll_event *evs, int n)
     // Check if we received a response
     if ((evs[i].events & EPOLLIN) == EPOLLIN)
     {
-      ret = redis_recv(con);
+      ret = redis_recv(cor, con);
       if (ret < 0)
       {
         fprintf(stderr, "handle_events: redis_recv failed\n");
@@ -995,7 +1043,7 @@ static int handle_events(struct core *cor, struct epoll_event *evs, int n)
     }
 
     // Send commands to redis while pending has not reached max
-    if (con->pending < cor->conf->max_pending)
+    if (con->pending < cor->lg->conf->max_pending)
     {
       ret = redis_send(cor, con);
       if (ret < 0)
@@ -1021,8 +1069,8 @@ static int redis_connect(struct core *cor, struct conn *con)
   struct epoll_event ev;
   struct sockaddr_in server_addr;
 
-  ip = cor->conf->ip;
-  port = cor->conf->port;
+  ip = cor->lg->conf->ip;
+  port = cor->lg->conf->port;
 
   conn_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (conn_fd < 0)
@@ -1085,7 +1133,7 @@ static int redis_connect_all(struct core *cor)
 {
   int i, ret;
 
-  for (i = 0; i < cor->conf->nconns; i++)
+  for (i = 0; i < cor->lg->conf->nconns; i++)
   {
     ret = redis_connect(cor, &cor->conns[i]);
     if (ret < 0)
@@ -1153,7 +1201,7 @@ static void *run_core(void *arg)
   }
 
   // Wait for connection and recv events
-  nevs = cor->conf->nconns;
+  nevs = cor->lg->conf->nconns;
   evs = calloc(nevs, sizeof(struct epoll_event));
   while (1)
   {
@@ -1296,12 +1344,57 @@ static void tp_metrics_save(struct loadgen *lg, uint64_t now)
   lg->i_mets++;
 }
 
-static void summarize_metrics(struct tp_metrics *tpmets, int i_mets)
+static void latency_add(struct loadgen *lg, uint64_t lat)
 {
+  __sync_fetch_and_add(&lg->lat_hist[lat], 1);
+}
+
+static void latency_percentiles(struct loadgen *lg)
+{
+  int i, j;
+  uint64_t total_count, cumu_count;
+  uint64_t targets[HIST_PERCENTILES];
+
+  total_count = 0;
+  for (int i = 0; i < HIST_BUCKETS; i++)
+  {
+    total_count += lg->lat_hist[i];
+  }
+
+  // Find target count for percentile
+  for (int i = 0; i < HIST_PERCENTILES; i++)
+  {
+    targets[i] = total_count * lg->latmets.percentiles[i];
+  }
+
+  // Find bins corresponding to target counts
+  for (i = 0; i < HIST_PERCENTILES; i++)
+  {
+    cumu_count = 0;
+    for (j = 0; j < HIST_BUCKETS; j++)
+    {
+      cumu_count += lg->lat_hist[j];
+      if (cumu_count >= targets[i])
+      {
+        lg->latmets.latencies[i] = j;
+        break;
+      }
+    }
+  }
+}
+
+static void summarize_metrics(struct loadgen *lg, int i_mets)
+{
+  int i;
   double avg_tp;
 
-  avg_tp = (double) tpmets[i_mets - 1].nreqs / (double) i_mets;
+  avg_tp = (double) lg->tpmets[i_mets - 1].nreqs / (double) i_mets;
   fprintf(stderr, "Avg TP: %f reqs/s\n", avg_tp);
+  for (i = 0; i < HIST_PERCENTILES; i++)
+  {
+    fprintf(stderr, "%lfp: %ld\n",
+        lg->latmets.percentiles[i], lg->latmets.latencies[i]);
+  }
 }
 
 /*****************************************************************************/
@@ -1380,8 +1473,11 @@ int main(int argc, char **argv)
   // Close all Redis connections
   redis_close_all(&lg);
 
+  // Calculate latency percentiles from histogram
+  latency_percentiles(&lg);
+
   // Print metrics for experiment run
-  summarize_metrics(lg.tpmets, lg.i_mets);
+  summarize_metrics(&lg, lg.i_mets);
 
   return 0;
 }
