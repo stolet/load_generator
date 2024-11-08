@@ -108,8 +108,10 @@ struct conn
 
   // Buffer used to transmit requests to redis
   char *tx_buf;
+  // Index to tx_buf
+  int tx_i;
   // Timestamp when request was sent. Used to compute latency.
-  uint64_t tx_ts;
+  uint64_t *tx_ts;
 
   // Buffer used to received requests from redis
   char *rx_buf;
@@ -119,8 +121,6 @@ struct conn
   int rx_i;
   // Number of expected characters in value for response
   int rx_nval;
-  // Number of characters parsed in value for response
-  int rx_parsed;
   // Parsing status of rx response
   enum parsing_status rx_status;
 
@@ -221,7 +221,6 @@ static int sample_sequential_set(struct conn *con);
 static int sample_sequential_get(struct conn *con);
 static int generate_key_set(struct core *cor, struct conn *con);
 static int generate_key_get(struct core *cor, struct conn *con);
-static void generate_val(char *val, int n);
 
 // Data path
 static int redis_set(struct core *cor, struct conn *con);
@@ -421,6 +420,7 @@ static int init_conn(struct config *conf, struct conn *con,
     uint64_t tsc_per_us)
 {
   int *set_keys;
+  uint64_t *tx_ts;
   char *tx_buf, *rx_buf;
 
   tx_buf = malloc(MAX_BUF);
@@ -444,15 +444,23 @@ static int init_conn(struct config *conf, struct conn *con,
     return -1;
   }
 
+  tx_ts = calloc(conf->max_pending, sizeof(uint64_t));
+  if (tx_ts == NULL)
+  {
+    fprintf(stderr, "init_conn: failed to malloc tx timestamps\n");
+    return -1;
+  }
+
   con->fd = -1;
   con->status = CONN_DISCONNETED;
   con->pending = 0;
   con->tx_buf = tx_buf;
+  con->tx_i = 0;
+  con->tx_ts = tx_ts;
   con->rx_buf = rx_buf;
   con->rx_nread = 0;
   con->rx_i = 0;
   con->rx_nval = 0;
-  con->rx_parsed = 0;
   con->rx_status = PARSING_OP;
   con->tokens = conf->rate;
   con->rate = conf->rate;
@@ -672,15 +680,6 @@ static int generate_key_get(struct core *cor, struct conn *con)
   }
 }
 
-static void generate_val(char *val, int n)
-{
-  for (int i = 0; i < n; i++)
-  {
-    val[i] = 'a';
-  }
-  val[n] = '\0';
-}
-
 /*****************************************************************************/
 
 /*****************************************************************************/
@@ -714,42 +713,61 @@ static void refill_tokens(struct conn *con, uint64_t tsc_per_us)
 
 static int redis_set(struct core *cor, struct conn *con)
 {
-  int key, key_len;
-  char buffer[MAX_BUF];
-  char key_str[MAX_BUF];
-  char val[MAX_VAL_SIZE + 1];
+  int i, ret, key, key_len;
+  char key_str[MAX_LEN_CHARS];
 
   // Generate key from distribution in config
   key = generate_key_set(cor, con);
-  key_len = snprintf(key_str, MAX_BUF, "%d", key);
-  if (key_len < 0)
+  key_len = sprintf(key_str, "%d", key);
+
+  // Add SET command
+  ret = snprintf(con->tx_buf + con->tx_i, 25, "*3\r\n$3\r\nSET\r\n$");
+  con->tx_i += ret;
+
+  // Add key length
+  ret = snprintf(con->tx_buf + con->tx_i, MAX_LEN_CHARS, "%d", key_len);
+  con->tx_i += ret;
+
+  // Break
+  ret = snprintf(con->tx_buf + con->tx_i, 25, "\r\n");
+  con->tx_i += ret;
+
+  // Add key string and null terminator
+  ret = snprintf(con->tx_buf + con->tx_i, strlen(key_str) + 1, key_str);
+  con->tx_i += ret;
+
+  // Break
+  ret = snprintf(con->tx_buf + con->tx_i, 25, "\r\n$");
+  con->tx_i += ret;
+
+  // Add val length
+  ret = snprintf(con->tx_buf + con->tx_i,
+      MAX_LEN_CHARS, "%ld", cor->lg->conf->vsize);
+  con->tx_i += ret;
+
+  // Break
+  ret = snprintf(con->tx_buf + con->tx_i, 25, "\r\n");
+  con->tx_i += ret;
+
+  // Add val string
+  for (i = 0; (size_t) i < cor->lg->conf->vsize && con->tx_i < MAX_BUF; i++)
   {
-    fprintf(stderr, "redis_set: snprintf for generating key failed\n");
+    con->tx_buf[con->tx_i] = 'a';
+    con->tx_i++;
   }
 
-  // Add something to set_val or else redis won't give us a response
-  generate_val(val, cor->lg->conf->vsize + 1);
+  // Break
+  con->tx_buf[con->tx_i] = '\0';
+  con->tx_i++;
+  con->tx_buf[con->tx_i] = '\r';
+  con->tx_i++;
+  con->tx_buf[con->tx_i] = '\n';
+  con->tx_i++;
 
-  // Craft SET command
-  int len = snprintf(buffer, sizeof(buffer),
-                     "*3\r\n$3\r\nSET\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                     (size_t) key_len, key_str, cor->lg->conf->vsize, val);
-
-  // fprintf(stderr, "SET SEND: %s\n", buffer);
-  if (len < 0)
-  {
-    perror("redis_set: snprintf failed for SET command");
-    return -1;
-  }
-
-  if (len > MAX_BUF)
-  {
-    perror("redis_set: buffer too small for SET command");
-    return -1;
-  }
-
-  con->tx_ts = get_us_tsc(cor->tsc_per_us);
-  int ret = send(con->fd, buffer, len, 0);
+  // Send request to network
+  con->tx_ts[con->pending] = get_us_tsc(cor->tsc_per_us);
+  ret = send(con->fd, con->tx_buf, con->tx_i, 0);
+  con->tx_i = 0;
   if (ret == -1)
   {
     perror("redis_set: failed to send SET command");
@@ -761,38 +779,40 @@ static int redis_set(struct core *cor, struct conn *con)
 
 static int redis_get(struct core *cor, struct conn *con)
 {
-  int key, key_len;
-  char key_str[MAX_BUF];
-  char buffer[MAX_BUF];
+  int ret, key, key_len;
+  char key_str[MAX_LEN_CHARS];
 
   // Generate key from distribution given in config
   key = generate_key_get(cor, con);
-  key_len = snprintf(key_str, MAX_BUF, "%d", key);
-  if (key_len < 0)
-  {
-    fprintf(stderr, "redis_get: snprintf for generating key failed\n");
-  }
+  key_len = sprintf(key_str, "%d", key);
 
-  // Craft GET command
-  int len = snprintf(buffer, sizeof(buffer),
-                     "*2\r\n$3\r\nGET\r\n$%zu\r\n%s\r\n",
-                     (size_t) key_len, key_str);
+  // Add GET command
+  ret = snprintf(con->tx_buf + con->tx_i, 25, "*2\r\n$3\r\nGET\r\n$");
+  con->tx_i += ret;
 
-  // fprintf(stderr, "GET SEND: %s\n", buffer);
-  if (len < 0)
-  {
-    perror("redis_get: snprintf failed for GET command");
-    return -1;
-  }
+  // Add key length
+  ret = snprintf(con->tx_buf + con->tx_i, MAX_LEN_CHARS, "%d", key_len);
+  con->tx_i += ret;
 
-  if (len > MAX_BUF)
-  {
-    perror("redis_get: buffer too small for GET command");
-    return -1;
-  }
+  // Break
+  ret = snprintf(con->tx_buf + con->tx_i, 25, "\r\n");
+  con->tx_i += ret;
 
-  con->tx_ts = get_us_tsc(cor->tsc_per_us);
-  int ret = send(con->fd, buffer, len, 0);
+  // Add key string and null terminator
+  ret = snprintf(con->tx_buf + con->tx_i, strlen(key_str) + 1, key_str);
+  con->tx_i += ret;
+
+  // Break
+  con->tx_buf[con->tx_i] = '\0';
+  con->tx_i++;
+  con->tx_buf[con->tx_i] = '\r';
+  con->tx_i++;
+  con->tx_buf[con->tx_i] = '\n';
+  con->tx_i++;
+
+  con->tx_ts[con->pending] = get_us_tsc(cor->tsc_per_us);
+  ret = send(con->fd, con->tx_buf, con->tx_i, 0);
+  con->tx_i = 0;
   if (ret == -1)
   {
     perror("redis_get: failed to send GET command");
@@ -877,10 +897,10 @@ static int redis_parse_op(struct conn *con)
 static int redis_parse_len(struct conn *con)
 {
   char lenstr[MAX_LEN_CHARS];
-  int rflag;
+  int i, rflag;
 
   rflag = 0;
-  for (;con->rx_i < con->rx_nread; con->rx_i++)
+  for (i = 0; con->rx_i < con->rx_nread; con->rx_i++, i++)
   {
     if (con->rx_buf[con->rx_i] == '\r')
     {
@@ -888,14 +908,14 @@ static int redis_parse_len(struct conn *con)
     }
     else if (rflag && con->rx_buf[con->rx_i] == '\n')
     {
-      con->rx_buf[con->rx_i - 1] = '\0';
+      con->rx_buf[con->rx_i] = '\0';
       con->rx_nval = atoi(lenstr);
       con->rx_status = PARSING_VAL;
       return 0;
     }
     else
     {
-      lenstr[con->rx_i] = con->rx_buf[con->rx_i];
+      lenstr[i] = con->rx_buf[con->rx_i];
     }
   }
 
@@ -909,7 +929,6 @@ static int redis_parse_val(struct conn *con)
   rflag = 0;
   for (;con->rx_i < con->rx_nread; con->rx_i++)
   {
-    con->rx_parsed += 1;
     if (con->rx_buf[con->rx_i] == '\r')
     {
       rflag = 1;
@@ -970,18 +989,18 @@ static int redis_recv(struct core *cor, struct conn *con)
 
     con->rx_nread = ret;
     con->rx_i = 0;
-
     while (con->rx_i < con->rx_nread)
     {
       redis_parse_response(con);
       if (con->rx_status == PARSING_COMPLETE)
       {
+        // fprintf(stderr, "%.*s", con->rx_i, con->rx_buf);
         con->pending--;
-        latency_add(cor->lg, get_us_tsc(cor->tsc_per_us) - con->tx_ts);
+        latency_add(cor->lg,
+            get_us_tsc(cor->tsc_per_us) - con->tx_ts[con->pending]);
         __sync_fetch_and_add(&con->nreqs, 1);
         con->rx_status = PARSING_OP;
       }
-
     }
 
     con->rx_i = 0;
@@ -996,7 +1015,6 @@ static int handle_events(struct core *cor, struct epoll_event *evs, int n)
   int i, ret, status;
   socklen_t slen;
   struct conn *con;
-
   for (i = 0; i < n; i++)
   {
     con = evs[i].data.ptr;
@@ -1206,9 +1224,10 @@ static void *run_core(void *arg)
   while (1)
   {
     // Check if there are any new events
-    ret = epoll_wait(cor->ep, evs, nevs, -1);
+    ret = epoll_wait(cor->ep, evs, nevs, 0);
     if (ret < 0)
     {
+      perror("");
       fprintf(stderr, "run_core: epoll wait failed\n");
       abort();
     }

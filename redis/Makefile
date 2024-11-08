@@ -3,7 +3,7 @@ BUILD_DIR = build
 
 CC = gcc
 
-CFLAGS = -Wall -Wextra -O0 -g -march=native
+CFLAGS = -Wall -Wextra -O3 -g -march=native
 LDFLAGS = -no-pie -pthread
 LDLIBS = -lm -lrt
 
