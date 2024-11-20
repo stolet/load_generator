@@ -119,8 +119,14 @@ struct conn
   int rx_nread;
   // Index to rx_buf
   int rx_i;
+  // Index to lenstr
+  int rx_len_i;
   // Number of expected characters in value for response
   int rx_nval;
+  // Flag that signals we parsed \r character
+  int rx_rflag;
+  // Char array used to hold string representing length of res value
+  char rx_lenstr[MAX_LEN_CHARS];
   // Parsing status of rx response
   enum parsing_status rx_status;
 
@@ -461,6 +467,7 @@ static int init_conn(struct config *conf, struct conn *con,
   con->rx_nread = 0;
   con->rx_i = 0;
   con->rx_nval = 0;
+  con->rx_rflag = 0;
   con->rx_status = PARSING_OP;
   con->tokens = conf->rate;
   con->rate = conf->rate;
@@ -896,39 +903,32 @@ static int redis_parse_op(struct conn *con)
 
 static int redis_parse_len(struct conn *con)
 {
-  char lenstr[MAX_LEN_CHARS];
-  int i, rflag;
-
-  rflag = 0;
-  for (i = 0; con->rx_i < con->rx_nread; con->rx_i++, i++)
+  for (;con->rx_i < con->rx_nread; con->rx_i++)
   {
-    if (con->rx_buf[con->rx_i] == '\r')
+    switch (con->rx_buf[con->rx_i])
     {
-      lenstr[i] = '\0';
-      rflag = 1;
-    }
-    else if (rflag && con->rx_buf[con->rx_i] == '\n')
-    {
-      con->rx_nval = atoi(lenstr);
+      case '\r':
+        con->rx_lenstr[con->rx_len_i] = '\0';
+        con->rx_len_i = 0;
+        con->rx_rflag = 1;
+        break;
+      case '\n':
+        con->rx_nval = atoi(con->rx_lenstr);
+        if (con->rx_nval == -1)
+          con->rx_status = PARSING_COMPLETE;
+        else
+          con->rx_status = PARSING_VAL;
 
-      /* If we got a NULL bulk string we have completed parsing */
-      if (con->rx_nval == -1)
-      {
-        // Increment to account for null char
+        con->rx_rflag = 0;
+
+        /* Increment rx_i manually since we are returning */
         con->rx_i++;
-        con->rx_status = PARSING_COMPLETE;
-      }
-      else
-      {
-
-        con->rx_status = PARSING_VAL;
-      }
-
-      return 0;
-    }
-    else
-    {
-      lenstr[i] = con->rx_buf[con->rx_i];
+        return 0;
+        break;
+      default:
+        con->rx_lenstr[con->rx_len_i] = con->rx_buf[con->rx_i];
+        con->rx_len_i++;
+        break;
     }
   }
 
@@ -951,7 +951,6 @@ static int redis_parse_val(struct conn *con)
       // Increment to account for null char
       con->rx_i++;
       con->rx_status = PARSING_COMPLETE;
-
       return 0;
     }
   }
