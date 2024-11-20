@@ -269,7 +269,7 @@ static void print_usage(const char *prog_name)
          "  --nconns       <INT>  Number of connections per core                          \n"
          "  --ncores       <INT>  Number of cores                                         \n"
          "  --pending      <INT>  Max number of requests per connection                   \n"
-         "  --vsize       <INT>  Value size for set requests                              \n"
+         "  --vsize        <INT>  Value size for set requests                             \n"
          "  --rate         <INT>  Send rate for each connection                           \n"
          "                                                                                \n"
          "Key options:                                                                    \n"
@@ -883,7 +883,7 @@ static int redis_parse_op(struct conn *con)
       return -1;
       break;
     default:
-      fprintf(stderr, "redis_parse_op: unknown reponse type\n");
+      fprintf(stderr, "redis_parse_op: unknown op=%c\n", con->rx_buf[con->rx_i]);
       con->rx_i += 1;
       con->rx_status = PARSING_ERR;
       return -1;
@@ -904,13 +904,26 @@ static int redis_parse_len(struct conn *con)
   {
     if (con->rx_buf[con->rx_i] == '\r')
     {
+      lenstr[i] = '\0';
       rflag = 1;
     }
     else if (rflag && con->rx_buf[con->rx_i] == '\n')
     {
-      con->rx_buf[con->rx_i] = '\0';
       con->rx_nval = atoi(lenstr);
-      con->rx_status = PARSING_VAL;
+
+      /* If we got a NULL bulk string we have completed parsing */
+      if (con->rx_nval == -1)
+      {
+        // Increment to account for null char
+        con->rx_i++;
+        con->rx_status = PARSING_COMPLETE;
+      }
+      else
+      {
+
+        con->rx_status = PARSING_VAL;
+      }
+
       return 0;
     }
     else
@@ -935,9 +948,10 @@ static int redis_parse_val(struct conn *con)
     }
     else if (rflag && con->rx_buf[con->rx_i] == '\n')
     {
-      con->rx_status = PARSING_COMPLETE;
       // Increment to account for null char
       con->rx_i++;
+      con->rx_status = PARSING_COMPLETE;
+
       return 0;
     }
   }
@@ -960,6 +974,7 @@ static int redis_parse_response(struct conn *con)
       break;
     case PARSING_ERR:
       fprintf(stderr, "redis_recv: sent unknown command\n");
+      abort();
       return -1;
       break;
     default:
@@ -994,7 +1009,6 @@ static int redis_recv(struct core *cor, struct conn *con)
       redis_parse_response(con);
       if (con->rx_status == PARSING_COMPLETE)
       {
-        // fprintf(stderr, "%.*s", con->rx_i, con->rx_buf);
         con->pending--;
         latency_add(cor->lg,
             get_us_tsc(cor->tsc_per_us) - con->tx_ts[con->pending]);
