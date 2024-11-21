@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <errno.h>
+#include <assert.h>
 
 #define RES_SSTRING '+'
 #define RES_BSTRING '$'
@@ -879,6 +880,7 @@ static int redis_parse_op(struct conn *con)
   {
     case RES_SSTRING:
       con->rx_status = PARSING_VAL;
+      con->rx_nval = 2;
       break;
     case RES_BSTRING:
       con->rx_status = PARSING_LEN;
@@ -915,14 +917,18 @@ static int redis_parse_len(struct conn *con)
       case '\n':
         con->rx_nval = atoi(con->rx_lenstr);
         if (con->rx_nval == -1)
+        {
           con->rx_status = PARSING_COMPLETE;
+          con->rx_nval = 0;
+        }
         else
+        {
           con->rx_status = PARSING_VAL;
-
-        con->rx_rflag = 0;
+        }
 
         /* Increment rx_i manually since we are returning */
         con->rx_i++;
+        con->rx_rflag = 0;
         return 0;
         break;
       default:
@@ -937,20 +943,19 @@ static int redis_parse_len(struct conn *con)
 
 static int redis_parse_val(struct conn *con)
 {
-  int rflag;
-
-  rflag = 0;
   for (;con->rx_i < con->rx_nread; con->rx_i++)
   {
     if (con->rx_buf[con->rx_i] == '\r')
     {
-      rflag = 1;
+      con->rx_rflag = 1;
     }
-    else if (rflag && con->rx_buf[con->rx_i] == '\n')
+    else if (con->rx_rflag && con->rx_buf[con->rx_i] == '\n')
     {
-      // Increment to account for null char
-      con->rx_i++;
+      /* Increment rx_i manually since we are returning */
+      con->rx_rflag = 0;
       con->rx_status = PARSING_COMPLETE;
+      con->rx_nval = 0;
+      con->rx_i++;
       return 0;
     }
   }
